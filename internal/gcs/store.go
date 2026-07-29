@@ -163,20 +163,8 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 	return obj, nil
 }
 
-// newObjectMeta derives the complete metadata resource for an object from its
-// bucket, name, declared content type and raw content.
-//
-// It was extracted verbatim from PutObject so that every code path which
-// materializes an object — simple, multipart and resumable upload as well as
-// compose — derives kind, id, size, contentType, timeCreated, updated, md5Hash,
-// crc32c and etag through byte-identical logic instead of duplicating it. An
-// empty contentType falls back to the GCS default of "application/octet-stream".
-//
-// The function is a pure function of its arguments: it is deliberately not a
-// method on Store, reads no Store field and touches no shared state. That makes
-// it lock-agnostic, and therefore safe to call from a caller which already holds
-// the store's write lock — ComposeObject does exactly that, which matters
-// because sync.RWMutex is not reentrant.
+// newObjectMeta builds metadata without accessing Store state, so callers may
+// invoke it while holding the store lock.
 func newObjectMeta(bucket, name, contentType string, content []byte) *Object {
 	if contentType == "" {
 		contentType = "application/octet-stream"
@@ -269,47 +257,25 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	return &obj, nil
 }
 
-// ComposeObject concatenates the content of the objects named by srcNames — in
-// the exact order given — into a single destination object dstName inside
-// bucket. It backs the storage.objects.compose JSON API method.
+// ComposeObject concatenates the content of srcNames, in the order given, into
+// a new object dstName inside bucket. Every source must live in that same
+// bucket: the operation only ever indexes the destination bucket's object map,
+// so a cross-bucket source is inexpressible. An existing destination is
+// overwritten unconditionally, exactly as PutObject and CopyObject do.
 //
-// Semantics:
-//   - Every source is resolved inside the destination bucket. A cross-bucket
-//     source is therefore inexpressible, which is how the API rule "all source
-//     objects must reside in the same bucket" is enforced structurally rather
-//     than by validation.
-//   - Concatenation is byte-exact and order-preserving: no separators, no
-//     re-encoding, no interpretation of the content.
-//   - Sources may repeat and may be empty. A repeated name contributes its bytes
-//     once per appearance (there is no de-duplication) and a zero-byte source
-//     simply contributes nothing; neither is an error. The destination may also
-//     appear among its own sources, because every source is read into a fresh
-//     buffer before the single write occurs.
-//   - contentType, when empty, falls back to the first source's content type and
-//     then to the "application/octet-stream" default applied by newObjectMeta.
-//   - An existing destination is overwritten unconditionally by plain map
-//     assignment, exactly as PutObject and CopyObject already do. There is no
-//     existence pre-check and no conflict response.
+// The entire read-all-then-write sequence runs under a single write lock, which
+// makes it atomic and fail-atomic: a concurrent delete cannot produce a
+// partially composed object, and a missing source aborts with nothing written.
+// It deliberately does not delegate to GetObject or PutObject — sync.RWMutex is
+// not reentrant, so either call would deadlock, and GetObject cannot
+// distinguish a missing bucket from a missing object, which is precisely the
+// distinction the two error cases must report.
 //
-// The entire read-all-then-write sequence runs under a single write lock, taken
-// once here. That is what makes the operation atomic: on a missing bucket or a
-// missing source it returns before any map write, so a partially composed object
-// is never observable. It is also why the method resolves s.buckets and
-// s.objects directly instead of delegating to GetObject or PutObject — those
-// acquire the same non-reentrant sync.RWMutex and would deadlock, and GetObject
-// additionally cannot distinguish a missing bucket from a missing object, which
-// is precisely the distinction the two not-found errors below carry. The error
-// strings reuse the sentinel shapes of DeleteObject and CopyObject so callers
-// can keep mapping them to 404 unchanged.
-//
-// Deliberate deviation from real Cloud Storage: real GCS attaches no md5Hash to
-// a composite object (it relies on CRC32C, which is derivable from the
-// components') and ignores any MD5 supplied in a compose request. This emulator
-// instead computes md5Hash over the concatenated bytes so a composite is
-// indistinguishable from an uploaded object — Object.Md5Hash carries no
-// omitempty and every other emulated object populates it, and clients already
-// treat md5Hash as optional so nothing breaks. Crc32c keeps the emulator-wide
-// placeholder value, since destination CRC32C verification is out of scope.
+// Note on md5Hash: real Cloud Storage omits md5Hash on composite objects and
+// relies on crc32c for their integrity. This emulator instead computes md5Hash
+// over the concatenated bytes so that a composed object carries the same
+// metadata set as every other emulated object; crc32c keeps the emulator-wide
+// placeholder value.
 func (s *Store) ComposeObject(bucket, dstName string, srcNames []string, contentType string) (*Object, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -317,32 +283,25 @@ func (s *Store) ComposeObject(bucket, dstName string, srcNames []string, content
 	if _, exists := s.buckets[bucket]; !exists {
 		return nil, fmt.Errorf("not found: bucket %q", bucket)
 	}
-	// Guaranteed non-nil once the bucket exists: CreateBucket and load() both
-	// initialize the per-bucket object map.
 	objs := s.objects[bucket]
 
-	// First pass: resolve every source and sum the total length. Doing this
-	// before a single byte is copied both sizes the destination buffer exactly
-	// (no reallocation while appending) and delivers fail-atomicity, because a
-	// missing source returns here, ahead of any mutation.
-	sources := make([]*storedObject, len(srcNames))
+	// Resolve every source before writing anything, so a missing source leaves
+	// the destination untouched. The same pass sizes the destination buffer and
+	// captures the first source's content type as the fallback.
+	sources := make([]*storedObject, 0, len(srcNames))
 	total := 0
-	for i, name := range srcNames {
-		src, ok := objs[name]
+	for i, srcName := range srcNames {
+		src, ok := objs[srcName]
 		if !ok {
-			return nil, fmt.Errorf("not found: object %q in bucket %q", name, bucket)
+			return nil, fmt.Errorf("not found: object %q in bucket %q", srcName, bucket)
 		}
 		if i == 0 && contentType == "" {
-			// The destination inherits the first source's content type unless
-			// the caller supplied one explicitly.
 			contentType = src.Meta.ContentType
 		}
-		sources[i] = src
+		sources = append(sources, src)
 		total += len(src.Content)
 	}
 
-	// Second pass: ordered concatenation into an independent buffer, so the
-	// composite never aliases a source's content.
 	content := make([]byte, 0, total)
 	for _, src := range sources {
 		content = append(content, src.Content...)
