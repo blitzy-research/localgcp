@@ -157,6 +157,17 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check for compose: {bucket}/o/{dstObject}/compose
+	//
+	// Must precede the /o/ branch below: that branch matches on the mere
+	// presence of "/o/" and would otherwise claim this request and answer 405.
+	// Gating on POST keeps the change additive — every other method on this
+	// path still falls through exactly as it did before.
+	if r.Method == http.MethodPost && strings.HasSuffix(rest, "/compose") {
+		s.handleComposeObject(w, r, rest)
+		return
+	}
+
 	// Check for /o/ (object operations)
 	oIdx := strings.Index(rest, "/o/")
 	if oIdx >= 0 {
