@@ -157,10 +157,16 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Match compose before the generic /o/ branch consumes the path.
-	if r.Method == http.MethodPost && strings.HasSuffix(rest, "/compose") {
-		s.handleComposeObject(w, r, rest)
-		return
+	// Match compose before the generic /o/ branch consumes the path. The
+	// /compose suffix is anchored to the object-name segment that follows /o/, so
+	// a POST carrying no destination object — {bucket}/o/compose or
+	// {bucket}/compose — keeps falling through to its pre-existing 405 instead of
+	// being claimed here.
+	if r.Method == http.MethodPost {
+		if i := strings.Index(rest, "/o/"); i >= 0 && strings.HasSuffix(rest[i+3:], "/compose") {
+			s.handleComposeObject(w, r, rest)
+			return
+		}
 	}
 
 	// Check for /o/ (object operations)
