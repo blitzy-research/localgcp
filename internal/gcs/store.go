@@ -156,6 +156,28 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 		return nil, fmt.Errorf("not found: bucket %q", bucket)
 	}
 
+	obj := newObjectMeta(bucket, name, contentType, content)
+
+	s.objects[bucket][name] = &storedObject{Meta: *obj, Content: content}
+	s.persist()
+	return obj, nil
+}
+
+// newObjectMeta derives the complete metadata resource for an object from its
+// bucket, name, declared content type and raw content.
+//
+// It was extracted verbatim from PutObject so that every code path which
+// materializes an object — simple, multipart and resumable upload as well as
+// compose — derives kind, id, size, contentType, timeCreated, updated, md5Hash,
+// crc32c and etag through byte-identical logic instead of duplicating it. An
+// empty contentType falls back to the GCS default of "application/octet-stream".
+//
+// The function is a pure function of its arguments: it is deliberately not a
+// method on Store, reads no Store field and touches no shared state. That makes
+// it lock-agnostic, and therefore safe to call from a caller which already holds
+// the store's write lock — ComposeObject does exactly that, which matters
+// because sync.RWMutex is not reentrant.
+func newObjectMeta(bucket, name, contentType string, content []byte) *Object {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
@@ -178,9 +200,7 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 		Etag:        hex.EncodeToString(sha256sum[:8]),
 	}
 
-	s.objects[bucket][name] = &storedObject{Meta: *obj, Content: content}
-	s.persist()
-	return obj, nil
+	return obj
 }
 
 func (s *Store) GetObject(bucket, name string) (*Object, []byte, bool) {
@@ -247,6 +267,92 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	s.objects[dstBucket][dstName] = &storedObject{Meta: obj, Content: content}
 	s.persist()
 	return &obj, nil
+}
+
+// ComposeObject concatenates the content of the objects named by srcNames — in
+// the exact order given — into a single destination object dstName inside
+// bucket. It backs the storage.objects.compose JSON API method.
+//
+// Semantics:
+//   - Every source is resolved inside the destination bucket. A cross-bucket
+//     source is therefore inexpressible, which is how the API rule "all source
+//     objects must reside in the same bucket" is enforced structurally rather
+//     than by validation.
+//   - Concatenation is byte-exact and order-preserving: no separators, no
+//     re-encoding, no interpretation of the content.
+//   - Sources may repeat and may be empty. A repeated name contributes its bytes
+//     once per appearance (there is no de-duplication) and a zero-byte source
+//     simply contributes nothing; neither is an error. The destination may also
+//     appear among its own sources, because every source is read into a fresh
+//     buffer before the single write occurs.
+//   - contentType, when empty, falls back to the first source's content type and
+//     then to the "application/octet-stream" default applied by newObjectMeta.
+//   - An existing destination is overwritten unconditionally by plain map
+//     assignment, exactly as PutObject and CopyObject already do. There is no
+//     existence pre-check and no conflict response.
+//
+// The entire read-all-then-write sequence runs under a single write lock, taken
+// once here. That is what makes the operation atomic: on a missing bucket or a
+// missing source it returns before any map write, so a partially composed object
+// is never observable. It is also why the method resolves s.buckets and
+// s.objects directly instead of delegating to GetObject or PutObject — those
+// acquire the same non-reentrant sync.RWMutex and would deadlock, and GetObject
+// additionally cannot distinguish a missing bucket from a missing object, which
+// is precisely the distinction the two not-found errors below carry. The error
+// strings reuse the sentinel shapes of DeleteObject and CopyObject so callers
+// can keep mapping them to 404 unchanged.
+//
+// Deliberate deviation from real Cloud Storage: real GCS attaches no md5Hash to
+// a composite object (it relies on CRC32C, which is derivable from the
+// components') and ignores any MD5 supplied in a compose request. This emulator
+// instead computes md5Hash over the concatenated bytes so a composite is
+// indistinguishable from an uploaded object — Object.Md5Hash carries no
+// omitempty and every other emulated object populates it, and clients already
+// treat md5Hash as optional so nothing breaks. Crc32c keeps the emulator-wide
+// placeholder value, since destination CRC32C verification is out of scope.
+func (s *Store) ComposeObject(bucket, dstName string, srcNames []string, contentType string) (*Object, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.buckets[bucket]; !exists {
+		return nil, fmt.Errorf("not found: bucket %q", bucket)
+	}
+	// Guaranteed non-nil once the bucket exists: CreateBucket and load() both
+	// initialize the per-bucket object map.
+	objs := s.objects[bucket]
+
+	// First pass: resolve every source and sum the total length. Doing this
+	// before a single byte is copied both sizes the destination buffer exactly
+	// (no reallocation while appending) and delivers fail-atomicity, because a
+	// missing source returns here, ahead of any mutation.
+	sources := make([]*storedObject, len(srcNames))
+	total := 0
+	for i, name := range srcNames {
+		src, ok := objs[name]
+		if !ok {
+			return nil, fmt.Errorf("not found: object %q in bucket %q", name, bucket)
+		}
+		if i == 0 && contentType == "" {
+			// The destination inherits the first source's content type unless
+			// the caller supplied one explicitly.
+			contentType = src.Meta.ContentType
+		}
+		sources[i] = src
+		total += len(src.Content)
+	}
+
+	// Second pass: ordered concatenation into an independent buffer, so the
+	// composite never aliases a source's content.
+	content := make([]byte, 0, total)
+	for _, src := range sources {
+		content = append(content, src.Content...)
+	}
+
+	obj := newObjectMeta(bucket, dstName, contentType, content)
+
+	s.objects[bucket][dstName] = &storedObject{Meta: *obj, Content: content}
+	s.persist()
+	return obj, nil
 }
 
 // ListObjects lists objects in a bucket with optional prefix and delimiter filtering.
