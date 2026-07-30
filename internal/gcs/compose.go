@@ -2,6 +2,7 @@ package gcs
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 )
@@ -10,6 +11,19 @@ import (
 // request may name. Cloud Storage accepts between 1 and 32 sources, so 32 is
 // valid and 33 is rejected with 400.
 const maxComposeSourceObjects = 32
+
+// maxComposeRequestBytes caps how much of a compose body is read before it is
+// decoded. maxComposeSourceObjects alone cannot bound the work a request costs,
+// because that check can only run once the whole sourceObjects array has already
+// been materialized; capping the bytes is what keeps an oversized array, source
+// name or ignored field from driving unbounded decoder allocation and CPU on
+// this unauthenticated endpoint.
+//
+// The cap sits far above any legitimate request: Cloud Storage object names are
+// at most 1024 bytes, so 32 maximum-length sources occupy roughly 34 KiB of
+// JSON, and the accepted-but-ignored fields add only a few KiB more. 1 MiB
+// therefore leaves ample headroom while still bounding the decoder.
+const maxComposeRequestBytes = 1 << 20
 
 // composeRequest models the supported compose body. Only sourceObjects is
 // required; encoding/json ignores unmodeled fields such as kind and
@@ -53,11 +67,22 @@ func (s *Service) handleComposeObject(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	// The decoder stays in its default, non-strict mode so unmodeled fields such
-	// as kind, deleteSourceObjects and destination.metadata remain tolerated for
-	// client compatibility.
+	// Bound the body before decoding it. The decoder stays in its default,
+	// non-strict mode so unmodeled fields such as kind, deleteSourceObjects and
+	// destination.metadata remain tolerated for client compatibility.
+	r.Body = http.MaxBytesReader(w, r.Body, maxComposeRequestBytes)
+
 	var req composeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// An oversized body is refused through the same shared 400 envelope, so
+		// the client sees a well-formed GCS error rather than a truncated
+		// response. errors.As rather than a type assertion, because the decoder
+		// is free to wrap the error the bounded reader returns.
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeBadRequest(w, "The compose request body exceeds the maximum size")
+			return
+		}
 		writeBadRequest(w, "Invalid compose request body")
 		return
 	}

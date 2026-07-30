@@ -99,8 +99,9 @@ func TestComposeObject(t *testing.T) {
 
 // TestComposeObjectEmptySources checks the malformed-input paths the handler
 // refuses before it ever reaches the store: an empty source list, a body that is
-// not valid JSON, and a source entry with no name. Each returns the shared GCS
-// 400 error envelope, and none of them may create the destination.
+// not valid JSON, a source entry with no name, and a body past the byte bound.
+// Each returns the shared GCS 400 error envelope, none of them may create or
+// modify the destination, and the server keeps serving well-formed requests.
 func TestComposeObjectEmptySources(t *testing.T) {
 	base := testServer(t)
 
@@ -172,6 +173,101 @@ func TestComposeObjectEmptySources(t *testing.T) {
 	}
 	assertStatus(t, missingResp, 404)
 	missingResp.Body.Close()
+
+	// The body is bounded by byte count before it is decoded. The source-count
+	// check cannot do that on its own, because it can only run once the whole
+	// sourceObjects array has already been materialized. The two bodies below name
+	// one legal source and one accepted-and-ignored field, so they are
+	// semantically identical and differ only in length: only a byte bound can
+	// explain the first composing and the second being refused.
+	simpleUpload(t, base, "compose-empty", "part-1", "Hello, ")
+
+	const padTemplate = `{"sourceObjects":[{"name":"part-1"}],"destination":{"metadata":{"pad":%q}}}`
+	overhead := len(fmt.Sprintf(padTemplate, ""))
+
+	atLimit := fmt.Sprintf(padTemplate, strings.Repeat("a", maxComposeRequestBytes-overhead))
+	if len(atLimit) != maxComposeRequestBytes {
+		t.Fatalf("expected a body of exactly %d bytes, got %d", maxComposeRequestBytes, len(atLimit))
+	}
+
+	atLimitResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose", atLimit)
+	assertStatus(t, atLimitResp, 200)
+
+	var atLimitObj Object
+	decodeBody(t, atLimitResp, &atLimitObj)
+	if atLimitObj.Size != "7" {
+		t.Fatalf("expected size 7, got %s", atLimitObj.Size)
+	}
+
+	overLimit := fmt.Sprintf(padTemplate, strings.Repeat("a", maxComposeRequestBytes-overhead+1))
+	if len(overLimit) != maxComposeRequestBytes+1 {
+		t.Fatalf("expected a body of exactly %d bytes, got %d", maxComposeRequestBytes+1, len(overLimit))
+	}
+
+	overLimitResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose", overLimit)
+	assertStatus(t, overLimitResp, 400)
+
+	var overLimitErr gcpError
+	decodeBody(t, overLimitResp, &overLimitErr)
+	if overLimitErr.Error.Code != 400 {
+		t.Fatalf("expected code 400, got %d", overLimitErr.Error.Code)
+	}
+	if len(overLimitErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(overLimitErr.Error.Errors))
+	}
+	if overLimitErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", overLimitErr.Error.Errors[0].Reason)
+	}
+	if overLimitErr.Error.Errors[0].Domain != "global" {
+		t.Fatalf("expected domain 'global', got %q", overLimitErr.Error.Errors[0].Domain)
+	}
+
+	// An oversized sourceObjects array is refused by the same bound, so the cost
+	// of decoding it never depends on how many entries it claims to carry.
+	entries := strings.Repeat(`{"name":"part-1"},`, 70000)
+	oversizedArray := `{"sourceObjects":[` + strings.TrimSuffix(entries, ",") + `]}`
+	if len(oversizedArray) <= maxComposeRequestBytes {
+		t.Fatalf("expected a body larger than %d bytes, got %d", maxComposeRequestBytes, len(oversizedArray))
+	}
+
+	arrayResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose", oversizedArray)
+	assertStatus(t, arrayResp, 400)
+
+	var arrayErr gcpError
+	decodeBody(t, arrayResp, &arrayErr)
+	if arrayErr.Error.Code != 400 {
+		t.Fatalf("expected code 400, got %d", arrayErr.Error.Code)
+	}
+	if len(arrayErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(arrayErr.Error.Errors))
+	}
+	if arrayErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", arrayErr.Error.Errors[0].Reason)
+	}
+
+	// Neither oversized body may have modified the destination the accepted
+	// request composed.
+	mediaResp, err := http.Get(base + "/storage/v1/b/compose-empty/o/merged?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, mediaResp, 200)
+	body, _ := io.ReadAll(mediaResp.Body)
+	mediaResp.Body.Close()
+	if string(body) != "Hello, " {
+		t.Fatalf("expected 'Hello, ', got %q", string(body))
+	}
+
+	// The server is still responsive after the rejections.
+	okResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
+		`{"sourceObjects":[{"name":"part-1"}]}`)
+	assertStatus(t, okResp, 200)
+
+	var okObj Object
+	decodeBody(t, okResp, &okObj)
+	if okObj.Size != "7" {
+		t.Fatalf("expected size 7, got %s", okObj.Size)
+	}
 }
 
 // TestComposeObjectTooManySources pins the source limit as inclusive at 32: a

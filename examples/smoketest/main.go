@@ -141,10 +141,7 @@ func testGCS(ctx context.Context) {
 		check("List objects (count=1)", fmt.Errorf("got %d objects", count))
 	}
 
-	// Compose objects (server-side concatenation). Sequenced after the count
-	// assertion above so that assertion still sees exactly one object, and every
-	// object created here is deleted again below — the emulator refuses to delete
-	// a non-empty bucket.
+	// Compose the parts after the count assertion so it still sees only hello.txt.
 	w1 := bucket.Object("part-1.txt").NewWriter(ctx)
 	w1.ContentType = "text/plain"
 	_, err = w1.Write([]byte("Hello, "))
@@ -161,9 +158,6 @@ func testGCS(ctx context.Context) {
 	}
 	check("Upload compose part 2", err)
 
-	// ComposerFrom issues the single objects.compose call that Python's
-	// Blob.compose and Node's Bucket.combine also reduce to, so one round trip
-	// covers the wire contract every official client depends on.
 	composed := "Hello, world"
 	dst := bucket.Object("merged.txt")
 	attrs, err := dst.ComposerFrom(bucket.Object("part-1.txt"), bucket.Object("part-2.txt")).Run(ctx)
