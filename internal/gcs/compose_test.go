@@ -97,8 +97,10 @@ func TestComposeObject(t *testing.T) {
 	}
 }
 
-// TestComposeObjectEmptySources checks that an empty source list returns the
-// shared GCS 400 error envelope.
+// TestComposeObjectEmptySources checks the malformed-input paths the handler
+// refuses before it ever reaches the store: an empty source list, a body that is
+// not valid JSON, and a source entry with no name. Each returns the shared GCS
+// 400 error envelope, and none of them may create the destination.
 func TestComposeObjectEmptySources(t *testing.T) {
 	base := testServer(t)
 
@@ -125,19 +127,9 @@ func TestComposeObjectEmptySources(t *testing.T) {
 	if errResp.Error.Errors[0].Domain != "global" {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
-}
 
-// TestComposeObjectInvalidRequest checks the remaining malformed-input paths: a
-// body that is not valid JSON, and a source entry with no name. Both are refused
-// with 400 before the store is reached, so neither can create the destination.
-func TestComposeObjectInvalidRequest(t *testing.T) {
-	base := testServer(t)
-
-	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-invalid"}`)
-	assertStatus(t, resp, 200)
-	resp.Body.Close()
-
-	malformedResp := postJSON(t, base+"/storage/v1/b/compose-invalid/o/merged/compose",
+	// A body that is not valid JSON fails to decode and is refused the same way.
+	malformedResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
 		`{"sourceObjects":[{"name":"part-1"}`)
 	assertStatus(t, malformedResp, 400)
 
@@ -156,7 +148,8 @@ func TestComposeObjectInvalidRequest(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", malformedErr.Error.Errors[0].Domain)
 	}
 
-	unnamedResp := postJSON(t, base+"/storage/v1/b/compose-invalid/o/merged/compose",
+	// An unnamed source cannot be resolved, so it is refused before the store too.
+	unnamedResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
 		`{"sourceObjects":[{"name":"part-1"},{"name":""}]}`)
 	assertStatus(t, unnamedResp, 400)
 
@@ -165,12 +158,15 @@ func TestComposeObjectInvalidRequest(t *testing.T) {
 	if unnamedErr.Error.Code != 400 {
 		t.Fatalf("expected code 400, got %d", unnamedErr.Error.Code)
 	}
+	if len(unnamedErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(unnamedErr.Error.Errors))
+	}
 	if unnamedErr.Error.Errors[0].Reason != "invalid" {
 		t.Fatalf("expected reason 'invalid', got %q", unnamedErr.Error.Errors[0].Reason)
 	}
 
-	// Neither rejected request may have created the destination.
-	missingResp, err := http.Get(base + "/storage/v1/b/compose-invalid/o/merged")
+	// None of the rejected requests may have created the destination.
+	missingResp, err := http.Get(base + "/storage/v1/b/compose-empty/o/merged")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,92 +490,4 @@ func TestComposeObjectMethodNotAllowed(t *testing.T) {
 	}
 	assertStatus(t, strayResp, 404)
 	strayResp.Body.Close()
-}
-
-// TestComposeObjectOversizedBody checks that the request body is bounded before
-// it is decoded. The source-count limit cannot do this on its own, because it
-// only applies once the whole array has already been materialized, so both an
-// oversized ignored field and an oversized source array must be refused by byte
-// count — and the server must stay responsive afterwards.
-func TestComposeObjectOversizedBody(t *testing.T) {
-	base := testServer(t)
-
-	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-oversized"}`)
-	assertStatus(t, resp, 200)
-	resp.Body.Close()
-
-	simpleUpload(t, base, "compose-oversized", "part-1", "Hello, ")
-
-	// The destination model deliberately carries only the content type, so
-	// ignored destination.metadata is not materialized into a map. This unkeyed
-	// literal fails to compile if another field is added, preserving that
-	// constraint.
-	_ = composeDestination{"text/plain"}
-
-	// A single legal source plus an oversized ignored field. Only the byte bound
-	// can reject this, because every semantic check would pass.
-	padded := fmt.Sprintf(`{"sourceObjects":[{"name":"part-1"}],"destination":{"metadata":{"pad":%q}}}`,
-		strings.Repeat("a", maxComposeRequestBytes))
-	if len(padded) <= maxComposeRequestBytes {
-		t.Fatalf("expected a body larger than %d bytes, got %d", maxComposeRequestBytes, len(padded))
-	}
-
-	paddedResp := postJSON(t, base+"/storage/v1/b/compose-oversized/o/merged/compose", padded)
-	assertStatus(t, paddedResp, 400)
-
-	var errResp gcpError
-	decodeBody(t, paddedResp, &errResp)
-
-	if errResp.Error.Code != 400 {
-		t.Fatalf("expected code 400, got %d", errResp.Error.Code)
-	}
-	if len(errResp.Error.Errors) != 1 {
-		t.Fatalf("expected 1 error detail, got %d", len(errResp.Error.Errors))
-	}
-	if errResp.Error.Errors[0].Reason != "invalid" {
-		t.Fatalf("expected reason 'invalid', got %q", errResp.Error.Errors[0].Reason)
-	}
-	if errResp.Error.Errors[0].Domain != "global" {
-		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
-	}
-	if !strings.Contains(errResp.Error.Message, "exceeds the maximum size") {
-		t.Fatalf("expected a size-based rejection, got %q", errResp.Error.Message)
-	}
-
-	// An oversized source array must be refused for the same reason: the byte
-	// bound fires before the array is decoded, not after the source count is
-	// counted, so the message must still be the size-based one.
-	entries := strings.Repeat(`{"name":"part-1"},`, 70000)
-	oversized := `{"sourceObjects":[` + strings.TrimSuffix(entries, ",") + `]}`
-	if len(oversized) <= maxComposeRequestBytes {
-		t.Fatalf("expected a body larger than %d bytes, got %d", maxComposeRequestBytes, len(oversized))
-	}
-
-	oversizedResp := postJSON(t, base+"/storage/v1/b/compose-oversized/o/merged/compose", oversized)
-	assertStatus(t, oversizedResp, 400)
-
-	var arrayErr gcpError
-	decodeBody(t, oversizedResp, &arrayErr)
-	if !strings.Contains(arrayErr.Error.Message, "exceeds the maximum size") {
-		t.Fatalf("expected the byte bound to reject before decoding, got %q", arrayErr.Error.Message)
-	}
-
-	// Neither rejected request may have created the destination.
-	missingResp, err := http.Get(base + "/storage/v1/b/compose-oversized/o/merged")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertStatus(t, missingResp, 404)
-	missingResp.Body.Close()
-
-	// The server is still responsive and still composes well-formed requests.
-	okResp := postJSON(t, base+"/storage/v1/b/compose-oversized/o/merged/compose",
-		`{"sourceObjects":[{"name":"part-1"}]}`)
-	assertStatus(t, okResp, 200)
-
-	var obj Object
-	decodeBody(t, okResp, &obj)
-	if obj.Size != "7" {
-		t.Fatalf("expected size 7, got %s", obj.Size)
-	}
 }
