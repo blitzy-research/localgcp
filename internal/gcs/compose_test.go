@@ -1,30 +1,5 @@
 package gcs
 
-// Protocol-level tests for the Cloud Storage JSON API objects.compose method:
-//
-//	POST /storage/v1/b/{destinationBucket}/o/{destinationObject}/compose
-//
-// The endpoint is driven over raw HTTP rather than through the official
-// cloud.google.com/go/storage client, for two deliberate reasons:
-//
-//   - The official client rejects a composer with zero sources before it puts
-//     anything on the wire, so the empty-sourceObjects contract is unreachable
-//     through the SDK. Posting the body directly is the only way to cover it.
-//   - Every other file in this package depends on the Go standard library alone,
-//     and these tests keep that property intact.
-//
-// SDK compatibility for compose is covered separately, out of process, by the
-// harness in examples/smoketest, which drives storage.ObjectHandle.ComposerFrom
-// against a running binary. That harness also exercises the XML API read path
-// (GET /{bucket}/{object}) that the Go client uses for reads; the reads below
-// use the JSON media path (?alt=media) instead. Both are served from the same
-// store map, so a composed object is readable through either one.
-//
-// Every helper used here already exists in the package — testServer, postJSON,
-// simpleUpload, assertStatus and decodeBody from gcs_test.go, plus the gcpError
-// envelope type from errors.go — so this file defines no helper of its own.
-// Each test creates its own bucket name so failures stay unambiguous.
-
 import (
 	"fmt"
 	"io"
@@ -33,142 +8,113 @@ import (
 	"testing"
 )
 
-// TestComposeObject is the acceptance test for the compose contract: two
-// uploaded parts are concatenated, in the order requested, into a single
-// destination object whose metadata is recomputed over the concatenated bytes.
+// --- objects.compose tests ---
 //
-// It also pins destination content-type resolution at both levels reachable
-// over HTTP: with no destination.contentType the composite inherits the first
-// source's type, and with an explicit destination.contentType that value wins.
+// These drive the real Service, mux, handler and store over raw HTTP. Raw HTTP
+// is required rather than the official client, because the Go storage client
+// rejects a zero-source composer before it sends anything, which would make the
+// empty-sourceObjects contract impossible to exercise.
+
+// TestComposeObject is the acceptance test: two uploaded parts concatenate in
+// order into one destination with the expected object metadata. It also covers
+// the two reachable levels of the content-type fallback and confirms the
+// accepted-but-ignored body fields (kind, destination.metadata,
+// deleteSourceObjects) do not break the request.
 func TestComposeObject(t *testing.T) {
 	base := testServer(t)
 
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-bucket"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-bucket"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
 
-	// simpleUpload uploads with Content-Type: text/plain, so text/plain is the
-	// type the composite must inherit when the request names none.
 	first := simpleUpload(t, base, "compose-bucket", "part-1", "Hello, ")
 	simpleUpload(t, base, "compose-bucket", "part-2", "world")
 
-	resp := postJSON(t, base+"/storage/v1/b/compose-bucket/o/merged/compose",
-		`{"sourceObjects":[{"name":"part-1"},{"name":"part-2"}]}`)
-	assertStatus(t, resp, 200)
+	// The query string carries what real clients always append. It must be
+	// ignored rather than interpreted, so alt=json is not mistaken for a media
+	// request the way the object GET handler treats alt=media.
+	composeResp := postJSON(t, base+"/storage/v1/b/compose-bucket/o/merged/compose?alt=json&prettyPrint=false",
+		`{"kind":"storage#composeRequest","sourceObjects":[{"name":"part-1"},{"name":"part-2"}],"destination":{"metadata":{"origin":"compose"}},"deleteSourceObjects":false}`)
+	assertStatus(t, composeResp, 200)
 
 	var obj Object
-	decodeBody(t, resp, &obj)
+	decodeBody(t, composeResp, &obj)
 
-	// The destination name is authoritative from the URL path, not the body.
-	if obj.Name != "merged" {
-		t.Fatalf("expected name 'merged', got %q", obj.Name)
-	}
-	if obj.Bucket != "compose-bucket" {
-		t.Fatalf("expected bucket 'compose-bucket', got %q", obj.Bucket)
+	if obj.Name != "merged" || obj.Bucket != "compose-bucket" {
+		t.Fatalf("unexpected compose result: %+v", obj)
 	}
 	if obj.Kind != "storage#object" {
 		t.Fatalf("expected kind 'storage#object', got %q", obj.Kind)
 	}
-	// 7 bytes ("Hello, ") + 5 bytes ("world"). Size is a string in the object
-	// resource, mirroring the API's uint64-as-string representation.
+	if obj.ID != "compose-bucket/merged" {
+		t.Fatalf("expected id 'compose-bucket/merged', got %q", obj.ID)
+	}
+	// 7 bytes of "Hello, " plus 5 bytes of "world"; Size is a string.
 	if obj.Size != "12" {
 		t.Fatalf("expected size 12, got %s", obj.Size)
 	}
 	if obj.Md5Hash == "" {
-		t.Fatal("expected non-empty md5Hash on the composed object")
+		t.Fatalf("expected recomputed md5Hash, got empty")
+	}
+	// The hash covers the concatenated bytes rather than being inherited from a
+	// source object.
+	if obj.Md5Hash == first.Md5Hash {
+		t.Fatalf("md5Hash was not recomputed: still %q", obj.Md5Hash)
 	}
 	if obj.Etag == "" {
-		t.Fatal("expected non-empty etag on the composed object")
+		t.Fatalf("expected recomputed etag, got empty")
 	}
-	if obj.TimeCreated == "" {
-		t.Fatal("expected non-empty timeCreated on the composed object")
+	if obj.TimeCreated == "" || obj.Updated == "" {
+		t.Fatalf("expected timeCreated and updated, got %q and %q", obj.TimeCreated, obj.Updated)
 	}
-	if obj.Updated == "" {
-		t.Fatal("expected non-empty updated on the composed object")
-	}
+	// No destination content type was supplied, so the first source's wins.
 	if obj.ContentType != first.ContentType {
-		t.Fatalf("expected content type %q inherited from the first source, got %q",
-			first.ContentType, obj.ContentType)
-	}
-	if obj.ContentType != "text/plain" {
-		t.Fatalf("expected content type 'text/plain', got %q", obj.ContentType)
+		t.Fatalf("expected content type %q from the first source, got %q", first.ContentType, obj.ContentType)
 	}
 
-	// The composite must be the byte-exact, order-preserving concatenation:
-	// no separators and no re-encoding.
 	mediaResp, err := http.Get(base + "/storage/v1/b/compose-bucket/o/merged?alt=media")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertStatus(t, mediaResp, 200)
-	data, err := io.ReadAll(mediaResp.Body)
+	body, _ := io.ReadAll(mediaResp.Body)
 	mediaResp.Body.Close()
-	if err != nil {
-		t.Fatalf("read composed content: %v", err)
-	}
-	if string(data) != "Hello, world" {
-		t.Fatalf("expected 'Hello, world', got %q", string(data))
+	if string(body) != "Hello, world" {
+		t.Fatalf("expected 'Hello, world', got %q", string(body))
 	}
 
-	// Variant: an explicit destination.contentType outranks the first source's
-	// type. The same body carries kind, destination.metadata and
-	// deleteSourceObjects, none of which this emulator models — a 200 proves
-	// they are accepted and ignored rather than rejected, which is what real
-	// clients require. kind in particular must not be mandatory, because the
-	// official Go client never transmits it.
 	typedResp := postJSON(t, base+"/storage/v1/b/compose-bucket/o/merged-typed/compose",
-		`{"kind":"storage#composeRequest","sourceObjects":[{"name":"part-1"},{"name":"part-2"}],`+
-			`"destination":{"contentType":"application/json","metadata":{"origin":"compose-test"}},`+
-			`"deleteSourceObjects":false}`)
+		`{"sourceObjects":[{"name":"part-1"},{"name":"part-2"}],"destination":{"contentType":"application/json"}}`)
 	assertStatus(t, typedResp, 200)
 
 	var typed Object
 	decodeBody(t, typedResp, &typed)
-
-	if typed.Name != "merged-typed" {
-		t.Fatalf("expected name 'merged-typed', got %q", typed.Name)
-	}
 	if typed.ContentType != "application/json" {
 		t.Fatalf("expected content type 'application/json', got %q", typed.ContentType)
 	}
 	if typed.Size != "12" {
 		t.Fatalf("expected size 12, got %s", typed.Size)
 	}
-
-	// deleteSourceObjects is ignored, so the sources must still be readable.
-	srcResp, err := http.Get(base + "/storage/v1/b/compose-bucket/o/part-1?alt=media")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertStatus(t, srcResp, 200)
-	srcResp.Body.Close()
 }
 
-// TestComposeObjectEmptySources verifies that an empty source list is rejected
-// with 400 in the standard GCS JSON error envelope, and that the rejection
-// happens before the store is touched so no destination is left behind.
-//
-// This case cannot be reached through the official Go client, which refuses to
-// send a composer with no sources, so raw HTTP is the only way to cover it.
+// TestComposeObjectEmptySources checks that an empty source list returns the
+// shared GCS 400 error envelope.
 func TestComposeObjectEmptySources(t *testing.T) {
 	base := testServer(t)
 
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-empty"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-empty"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
 
-	resp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
+	composeResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
 		`{"sourceObjects":[]}`)
-	assertStatus(t, resp, 400)
+	assertStatus(t, composeResp, 400)
 
 	var errResp gcpError
-	decodeBody(t, resp, &errResp)
+	decodeBody(t, composeResp, &errResp)
 
 	if errResp.Error.Code != 400 {
 		t.Fatalf("expected code 400, got %d", errResp.Error.Code)
-	}
-	if errResp.Error.Message == "" {
-		t.Fatal("expected non-empty error message")
 	}
 	if len(errResp.Error.Errors) != 1 {
 		t.Fatalf("expected 1 error detail, got %d", len(errResp.Error.Errors))
@@ -179,50 +125,84 @@ func TestComposeObjectEmptySources(t *testing.T) {
 	if errResp.Error.Errors[0].Domain != "global" {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
+}
 
-	// A rejected request must not have created the destination.
-	check, err := http.Get(base + "/storage/v1/b/compose-empty/o/merged?alt=media")
+// TestComposeObjectInvalidRequest checks the remaining malformed-input paths: a
+// body that is not valid JSON, and a source entry with no name. Both are refused
+// with 400 before the store is reached, so neither can create the destination.
+func TestComposeObjectInvalidRequest(t *testing.T) {
+	base := testServer(t)
+
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-invalid"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
+
+	malformedResp := postJSON(t, base+"/storage/v1/b/compose-invalid/o/merged/compose",
+		`{"sourceObjects":[{"name":"part-1"}`)
+	assertStatus(t, malformedResp, 400)
+
+	var malformedErr gcpError
+	decodeBody(t, malformedResp, &malformedErr)
+	if malformedErr.Error.Code != 400 {
+		t.Fatalf("expected code 400, got %d", malformedErr.Error.Code)
+	}
+	if len(malformedErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(malformedErr.Error.Errors))
+	}
+	if malformedErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", malformedErr.Error.Errors[0].Reason)
+	}
+	if malformedErr.Error.Errors[0].Domain != "global" {
+		t.Fatalf("expected domain 'global', got %q", malformedErr.Error.Errors[0].Domain)
+	}
+
+	unnamedResp := postJSON(t, base+"/storage/v1/b/compose-invalid/o/merged/compose",
+		`{"sourceObjects":[{"name":"part-1"},{"name":""}]}`)
+	assertStatus(t, unnamedResp, 400)
+
+	var unnamedErr gcpError
+	decodeBody(t, unnamedResp, &unnamedErr)
+	if unnamedErr.Error.Code != 400 {
+		t.Fatalf("expected code 400, got %d", unnamedErr.Error.Code)
+	}
+	if unnamedErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", unnamedErr.Error.Errors[0].Reason)
+	}
+
+	// Neither rejected request may have created the destination.
+	missingResp, err := http.Get(base + "/storage/v1/b/compose-invalid/o/merged")
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertStatus(t, check, 404)
-	check.Body.Close()
+	assertStatus(t, missingResp, 404)
+	missingResp.Body.Close()
 }
 
-// TestComposeObjectTooManySources pins the documented source-count boundary as
-// inclusive at 32: a 32-entry list succeeds and a 33-entry list is rejected with
-// 400. Both lists repeat a single uploaded object, which is legal because Cloud
-// Storage permits the same source to appear more than once and the emulator
-// performs no de-duplication — every occurrence contributes its bytes.
-//
-// The final case proves the validation ORDER: a request that is both over-long
-// and aimed at a bucket that does not exist must answer 400, not 404, because
-// the count check runs before the store is consulted.
+// TestComposeObjectTooManySources pins the source limit as inclusive at 32: a
+// 33-entry list is rejected with 400 while a 32-entry list succeeds. Duplicate
+// source names are permitted, so one upload builds both cases.
 func TestComposeObjectTooManySources(t *testing.T) {
 	base := testServer(t)
 
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-limit"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-limit"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
 
-	// One byte per source keeps the expected composite size equal to the number
-	// of sources named.
-	simpleUpload(t, base, "compose-limit", "part.txt", "x")
+	simpleUpload(t, base, "compose-limit", "part", "x")
 
-	// Guard the contract constant itself, so the boundary assertions below
-	// cannot pass vacuously against a wrong limit.
+	// Guard the contract constant itself, so the boundary assertions below cannot
+	// pass vacuously against a wrong limit.
 	if maxComposeSourceObjects != 32 {
 		t.Fatalf("expected the compose source limit to be 32, got %d", maxComposeSourceObjects)
 	}
 
-	entry := `{"name":"part.txt"}`
-	atLimit := fmt.Sprintf(`{"sourceObjects":[%s]}`,
-		strings.TrimSuffix(strings.Repeat(entry+",", maxComposeSourceObjects), ","))
-	overLimit := fmt.Sprintf(`{"sourceObjects":[%s]}`,
-		strings.TrimSuffix(strings.Repeat(entry+",", maxComposeSourceObjects+1), ","))
+	entries := make([]string, maxComposeSourceObjects+1)
+	for i := range entries {
+		entries[i] = `{"name":"part"}`
+	}
 
-	// 33 sources — one past the limit, so rejected.
-	overResp := postJSON(t, base+"/storage/v1/b/compose-limit/o/too-many/compose", overLimit)
+	overResp := postJSON(t, base+"/storage/v1/b/compose-limit/o/too-many/compose",
+		fmt.Sprintf(`{"sourceObjects":[%s]}`, strings.Join(entries, ",")))
 	assertStatus(t, overResp, 400)
 
 	var errResp gcpError
@@ -241,112 +221,112 @@ func TestComposeObjectTooManySources(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
 
-	// 32 sources — exactly at the limit, so accepted.
-	atResp := postJSON(t, base+"/storage/v1/b/compose-limit/o/at-limit/compose", atLimit)
-	assertStatus(t, atResp, 200)
+	// The rejected request must not have created the destination.
+	missingResp, err := http.Get(base + "/storage/v1/b/compose-limit/o/too-many")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, missingResp, 404)
+	missingResp.Body.Close()
+
+	atLimitResp := postJSON(t, base+"/storage/v1/b/compose-limit/o/at-limit/compose",
+		fmt.Sprintf(`{"sourceObjects":[%s]}`, strings.Join(entries[:maxComposeSourceObjects], ",")))
+	assertStatus(t, atLimitResp, 200)
 
 	var obj Object
-	decodeBody(t, atResp, &obj)
+	decodeBody(t, atLimitResp, &obj)
 	if obj.Size != "32" {
 		t.Fatalf("expected size 32, got %s", obj.Size)
 	}
 
-	mediaResp, err := http.Get(base + "/storage/v1/b/compose-limit/o/at-limit?alt=media")
+	// Validation order: the source count is checked before the store is consulted,
+	// so a request that is both over-limit and aimed at a nonexistent bucket
+	// reports the 400 rather than the 404.
+	orderResp := postJSON(t, base+"/storage/v1/b/no-such-bucket/o/too-many/compose",
+		fmt.Sprintf(`{"sourceObjects":[%s]}`, strings.Join(entries, ",")))
+	assertStatus(t, orderResp, 400)
+
+	var orderErr gcpError
+	decodeBody(t, orderResp, &orderErr)
+	if len(orderErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(orderErr.Error.Errors))
+	}
+	if orderErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid' to win over 'notFound', got %q",
+			orderErr.Error.Errors[0].Reason)
+	}
+}
+
+// TestComposeObjectSourceNotFound checks that a missing source yields 404 and
+// that the operation is fail-atomic: the pre-existing destination keeps its
+// original bytes, so nothing was partially written.
+func TestComposeObjectSourceNotFound(t *testing.T) {
+	base := testServer(t)
+
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-missing-source"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
+
+	simpleUpload(t, base, "compose-missing-source", "part-1", "Hello, ")
+	// Pre-create the destination so fail-atomicity is observable.
+	simpleUpload(t, base, "compose-missing-source", "merged", "original content")
+
+	composeResp := postJSON(t, base+"/storage/v1/b/compose-missing-source/o/merged/compose",
+		`{"sourceObjects":[{"name":"part-1"},{"name":"absent"}]}`)
+	assertStatus(t, composeResp, 404)
+
+	var errResp gcpError
+	decodeBody(t, composeResp, &errResp)
+
+	if errResp.Error.Code != 404 {
+		t.Fatalf("expected code 404, got %d", errResp.Error.Code)
+	}
+	if len(errResp.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(errResp.Error.Errors))
+	}
+	if errResp.Error.Errors[0].Reason != "notFound" {
+		t.Fatalf("expected reason 'notFound', got %q", errResp.Error.Errors[0].Reason)
+	}
+	if errResp.Error.Errors[0].Domain != "global" {
+		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
+	}
+
+	// Fail-atomicity: the destination was neither truncated nor partially written.
+	mediaResp, err := http.Get(base + "/storage/v1/b/compose-missing-source/o/merged?alt=media")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertStatus(t, mediaResp, 200)
-	data, err := io.ReadAll(mediaResp.Body)
+	body, _ := io.ReadAll(mediaResp.Body)
 	mediaResp.Body.Close()
-	if err != nil {
-		t.Fatalf("read composed content: %v", err)
-	}
-	if string(data) != strings.Repeat("x", maxComposeSourceObjects) {
-		t.Fatalf("expected %d repeated bytes, got %q", maxComposeSourceObjects, string(data))
+	if string(body) != "original content" {
+		t.Fatalf("expected destination to keep 'original content', got %q", string(body))
 	}
 
-	// Ordered validation: cardinality precedes store access, so an over-long
-	// list aimed at a missing bucket is a 400 and never a 404.
-	orderResp := postJSON(t, base+"/storage/v1/b/no-such-bucket/o/too-many/compose", overLimit)
-	assertStatus(t, orderResp, 400)
-	orderResp.Body.Close()
-}
-
-// TestComposeObjectSourceNotFound verifies that a named source which does not
-// exist fails the whole request with 404, and — critically — that the operation
-// is fail-atomic. Every source is resolved before the single write happens, so
-// the destination must not exist afterwards even though the first source
-// resolved successfully, and the source that did resolve must be untouched.
-func TestComposeObjectSourceNotFound(t *testing.T) {
-	base := testServer(t)
-
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-missing-src"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
-
-	// Only the first of the two named sources is uploaded.
-	simpleUpload(t, base, "compose-missing-src", "part-1", "present")
-
-	resp := postJSON(t, base+"/storage/v1/b/compose-missing-src/o/merged/compose",
-		`{"sourceObjects":[{"name":"part-1"},{"name":"absent.txt"}]}`)
-	assertStatus(t, resp, 404)
-
-	var errResp gcpError
-	decodeBody(t, resp, &errResp)
-
-	if errResp.Error.Code != 404 {
-		t.Fatalf("expected code 404, got %d", errResp.Error.Code)
-	}
-	if len(errResp.Error.Errors) != 1 {
-		t.Fatalf("expected 1 error detail, got %d", len(errResp.Error.Errors))
-	}
-	if errResp.Error.Errors[0].Reason != "notFound" {
-		t.Fatalf("expected reason 'notFound', got %q", errResp.Error.Errors[0].Reason)
-	}
-	if errResp.Error.Errors[0].Domain != "global" {
-		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
-	}
-
-	// Fail-atomicity: no partially composed destination may be observable.
-	check, err := http.Get(base + "/storage/v1/b/compose-missing-src/o/merged?alt=media")
-	if err != nil {
-		t.Fatal(err)
-	}
-	assertStatus(t, check, 404)
-	check.Body.Close()
-
-	// The source that resolved must still be intact.
-	srcResp, err := http.Get(base + "/storage/v1/b/compose-missing-src/o/part-1?alt=media")
+	// The source that did resolve must still be intact as well.
+	srcResp, err := http.Get(base + "/storage/v1/b/compose-missing-source/o/part-1?alt=media")
 	if err != nil {
 		t.Fatal(err)
 	}
 	assertStatus(t, srcResp, 200)
-	srcData, err := io.ReadAll(srcResp.Body)
+	srcBody, _ := io.ReadAll(srcResp.Body)
 	srcResp.Body.Close()
-	if err != nil {
-		t.Fatalf("read surviving source: %v", err)
-	}
-	if string(srcData) != "present" {
-		t.Fatalf("expected 'present', got %q", string(srcData))
+	if string(srcBody) != "Hello, " {
+		t.Fatalf("expected surviving source 'Hello, ', got %q", string(srcBody))
 	}
 }
 
-// TestComposeObjectBucketNotFound verifies the second 404 condition: the
-// destination bucket itself does not exist. The store reports this separately
-// from a missing source, which is why compose is a single store-level operation
-// rather than handler orchestration over the read-locked getter — that getter
-// returns a bare false and cannot tell the two cases apart.
+// TestComposeObjectBucketNotFound checks that composing into a bucket that does
+// not exist yields 404 rather than creating it.
 func TestComposeObjectBucketNotFound(t *testing.T) {
 	base := testServer(t)
 
-	// No bucket is created. The source list is valid and in range so the request
-	// clears cardinality validation and actually reaches the store.
-	resp := postJSON(t, base+"/storage/v1/b/no-such-bucket/o/merged/compose",
+	composeResp := postJSON(t, base+"/storage/v1/b/compose-no-bucket/o/merged/compose",
 		`{"sourceObjects":[{"name":"part-1"}]}`)
-	assertStatus(t, resp, 404)
+	assertStatus(t, composeResp, 404)
 
 	var errResp gcpError
-	decodeBody(t, resp, &errResp)
+	decodeBody(t, composeResp, &errResp)
 
 	if errResp.Error.Code != 404 {
 		t.Fatalf("expected code 404, got %d", errResp.Error.Code)
@@ -360,39 +340,42 @@ func TestComposeObjectBucketNotFound(t *testing.T) {
 	if errResp.Error.Errors[0].Domain != "global" {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
+
+	bucketResp, err := http.Get(base + "/storage/v1/b/compose-no-bucket")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, bucketResp, 404)
+	bucketResp.Body.Close()
 }
 
-// TestComposeObjectWithSlashesInName verifies that slashes survive the manual
-// path routing on both sides of the operation: the sources live under a prefix
-// and the destination name contains two slashes. Only the trailing /compose
-// token is stripped from the path, so the destination name must round-trip
-// exactly and remain readable at its full path.
+// TestComposeObjectWithSlashesInName checks that a destination name containing
+// slashes survives path parsing intact, since the name is authoritative from the
+// URL and only the trailing /compose token is stripped.
 func TestComposeObjectWithSlashesInName(t *testing.T) {
 	base := testServer(t)
 
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-slash"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
-
-	simpleUpload(t, base, "compose-slash", "parts/part-1", "top ")
-	simpleUpload(t, base, "compose-slash", "parts/part-2", "level")
-
-	resp := postJSON(t, base+"/storage/v1/b/compose-slash/o/nested/dir/merged/compose",
-		`{"sourceObjects":[{"name":"parts/part-1"},{"name":"parts/part-2"}]}`)
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-slash"}`)
 	assertStatus(t, resp, 200)
+	resp.Body.Close()
+
+	simpleUpload(t, base, "compose-slash", "parts/part-1", "Hello, ")
+	simpleUpload(t, base, "compose-slash", "parts/part-2", "world")
+
+	composeResp := postJSON(t, base+"/storage/v1/b/compose-slash/o/nested/dir/merged/compose",
+		`{"sourceObjects":[{"name":"parts/part-1"},{"name":"parts/part-2"}]}`)
+	assertStatus(t, composeResp, 200)
 
 	var obj Object
-	decodeBody(t, resp, &obj)
-
+	decodeBody(t, composeResp, &obj)
 	if obj.Name != "nested/dir/merged" {
-		t.Fatalf("expected name 'nested/dir/merged', got %q", obj.Name)
+		t.Fatalf("expected 'nested/dir/merged', got %q", obj.Name)
 	}
 	if obj.Bucket != "compose-slash" {
 		t.Fatalf("expected bucket 'compose-slash', got %q", obj.Bucket)
 	}
-	// 4 bytes ("top ") + 5 bytes ("level").
-	if obj.Size != "9" {
-		t.Fatalf("expected size 9, got %s", obj.Size)
+	if obj.Size != "12" {
+		t.Fatalf("expected size 12, got %s", obj.Size)
 	}
 
 	mediaResp, err := http.Get(base + "/storage/v1/b/compose-slash/o/nested/dir/merged?alt=media")
@@ -400,54 +383,47 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStatus(t, mediaResp, 200)
-	data, err := io.ReadAll(mediaResp.Body)
+	body, _ := io.ReadAll(mediaResp.Body)
 	mediaResp.Body.Close()
-	if err != nil {
-		t.Fatalf("read composed content: %v", err)
-	}
-	if string(data) != "top level" {
-		t.Fatalf("expected 'top level', got %q", string(data))
+	if string(body) != "Hello, world" {
+		t.Fatalf("expected 'Hello, world', got %q", string(body))
 	}
 }
 
-// TestComposeObjectOverwritesDestination verifies that composing into a name
-// that already exists replaces it unconditionally — no existence pre-check and
-// no 409, exactly how upload and copy already behave — and that the
-// destination's size and hashes are recomputed over the new bytes instead of
-// being carried over from the object that was replaced.
+// TestComposeObjectOverwritesDestination checks that an existing destination is
+// replaced unconditionally — no conflict response, and its content and size both
+// reflect the composition.
 func TestComposeObjectOverwritesDestination(t *testing.T) {
 	base := testServer(t)
 
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-overwrite"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
-
-	// The destination already exists, with content that is deliberately longer
-	// than the composite so a stale size is impossible to miss.
-	stale := simpleUpload(t, base, "compose-overwrite", "merged", "stale content that is longer")
-	simpleUpload(t, base, "compose-overwrite", "part-1", "fresh ")
-	simpleUpload(t, base, "compose-overwrite", "part-2", "bytes")
-
-	resp := postJSON(t, base+"/storage/v1/b/compose-overwrite/o/merged/compose",
-		`{"sourceObjects":[{"name":"part-1"},{"name":"part-2"}]}`)
-	// 200 and never 409: an existing destination is simply overwritten.
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-overwrite"}`)
 	assertStatus(t, resp, 200)
+	resp.Body.Close()
+
+	stale := simpleUpload(t, base, "compose-overwrite", "merged", "stale destination content")
+	if stale.Size != "25" {
+		t.Fatalf("expected size 25, got %s", stale.Size)
+	}
+	simpleUpload(t, base, "compose-overwrite", "part-1", "Hello, ")
+	simpleUpload(t, base, "compose-overwrite", "part-2", "world")
+
+	composeResp := postJSON(t, base+"/storage/v1/b/compose-overwrite/o/merged/compose",
+		`{"sourceObjects":[{"name":"part-1"},{"name":"part-2"}]}`)
+	assertStatus(t, composeResp, 200)
 
 	var obj Object
-	decodeBody(t, resp, &obj)
-
-	// 6 bytes ("fresh ") + 5 bytes ("bytes").
-	if obj.Size != "11" {
-		t.Fatalf("expected size 11, got %s", obj.Size)
+	decodeBody(t, composeResp, &obj)
+	if obj.Size != "12" {
+		t.Fatalf("expected size 12, got %s", obj.Size)
 	}
 	if obj.Size == stale.Size {
-		t.Fatalf("expected the size to be recomputed, still %s", obj.Size)
+		t.Fatalf("expected a recomputed size, got the stale %s", obj.Size)
 	}
 	if obj.Md5Hash == stale.Md5Hash {
-		t.Fatalf("expected md5Hash to be recomputed, still %q", obj.Md5Hash)
+		t.Fatalf("expected a recomputed md5Hash, got the stale %q", obj.Md5Hash)
 	}
 	if obj.Etag == stale.Etag {
-		t.Fatalf("expected etag to be recomputed, still %q", obj.Etag)
+		t.Fatalf("expected a recomputed etag, got the stale %q", obj.Etag)
 	}
 
 	mediaResp, err := http.Get(base + "/storage/v1/b/compose-overwrite/o/merged?alt=media")
@@ -455,43 +431,35 @@ func TestComposeObjectOverwritesDestination(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertStatus(t, mediaResp, 200)
-	data, err := io.ReadAll(mediaResp.Body)
+	body, _ := io.ReadAll(mediaResp.Body)
 	mediaResp.Body.Close()
-	if err != nil {
-		t.Fatalf("read composed content: %v", err)
-	}
-	if string(data) != "fresh bytes" {
-		t.Fatalf("expected 'fresh bytes', got %q", string(data))
+	if string(body) != "Hello, world" {
+		t.Fatalf("expected 'Hello, world', got %q", string(body))
 	}
 }
 
-// TestComposeObjectMethodNotAllowed is the zero-regression guard for the new
-// dispatch branch. Because that branch is gated on POST, every other method on
-// the compose path must keep answering exactly as it did before compose existed.
-//
-// PUT is the method to use here. GET and DELETE are claimed by the
-// object-operations switch and answer 404 from the object handlers, whereas PUT
-// falls through to that switch's default case and yields the pre-existing 405.
+// TestComposeObjectMethodNotAllowed verifies that PUT bypasses the POST-only
+// compose branch and reaches the generic object-operation 405 path. GET and
+// DELETE instead take their object lookup/delete paths and return 404.
 func TestComposeObjectMethodNotAllowed(t *testing.T) {
 	base := testServer(t)
 
-	bucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-method"}`)
-	assertStatus(t, bucketResp, 200)
-	bucketResp.Body.Close()
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-method"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
 
-	url := base + "/storage/v1/b/compose-method/o/merged/compose"
-	req, err := http.NewRequest(http.MethodPut, url, nil)
+	req, err := http.NewRequest(http.MethodPut, base+"/storage/v1/b/compose-method/o/merged/compose", nil)
 	if err != nil {
-		t.Fatalf("new PUT request: %v", err)
+		t.Fatal(err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	putResp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("PUT %s: %v", url, err)
+		t.Fatal(err)
 	}
-	assertStatus(t, resp, 405)
+	assertStatus(t, putResp, 405)
 
 	var errResp gcpError
-	decodeBody(t, resp, &errResp)
+	decodeBody(t, putResp, &errResp)
 
 	if errResp.Error.Code != 405 {
 		t.Fatalf("expected code 405, got %d", errResp.Error.Code)
@@ -504,5 +472,114 @@ func TestComposeObjectMethodNotAllowed(t *testing.T) {
 	}
 	if errResp.Error.Errors[0].Domain != "global" {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
+	}
+
+	// The /compose suffix is anchored to the object-name segment, so a POST that
+	// names no destination object is not a compose request and keeps its
+	// pre-existing 405 instead of composing into an object called "compose".
+	noObjectResp := postJSON(t, base+"/storage/v1/b/compose-method/o/compose",
+		`{"sourceObjects":[{"name":"part-1"}]}`)
+	assertStatus(t, noObjectResp, 405)
+	noObjectResp.Body.Close()
+
+	noPathResp := postJSON(t, base+"/storage/v1/b/compose-method/compose",
+		`{"sourceObjects":[{"name":"part-1"}]}`)
+	assertStatus(t, noPathResp, 405)
+	noPathResp.Body.Close()
+
+	// Neither shape may have created an object.
+	strayResp, err := http.Get(base + "/storage/v1/b/compose-method/o/compose")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, strayResp, 404)
+	strayResp.Body.Close()
+}
+
+// TestComposeObjectOversizedBody checks that the request body is bounded before
+// it is decoded. The source-count limit cannot do this on its own, because it
+// only applies once the whole array has already been materialized, so both an
+// oversized ignored field and an oversized source array must be refused by byte
+// count — and the server must stay responsive afterwards.
+func TestComposeObjectOversizedBody(t *testing.T) {
+	base := testServer(t)
+
+	resp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-oversized"}`)
+	assertStatus(t, resp, 200)
+	resp.Body.Close()
+
+	simpleUpload(t, base, "compose-oversized", "part-1", "Hello, ")
+
+	// The destination model deliberately carries only the content type, so
+	// ignored destination.metadata is not materialized into a map. This unkeyed
+	// literal fails to compile if another field is added, preserving that
+	// constraint.
+	_ = composeDestination{"text/plain"}
+
+	// A single legal source plus an oversized ignored field. Only the byte bound
+	// can reject this, because every semantic check would pass.
+	padded := fmt.Sprintf(`{"sourceObjects":[{"name":"part-1"}],"destination":{"metadata":{"pad":%q}}}`,
+		strings.Repeat("a", maxComposeRequestBytes))
+	if len(padded) <= maxComposeRequestBytes {
+		t.Fatalf("expected a body larger than %d bytes, got %d", maxComposeRequestBytes, len(padded))
+	}
+
+	paddedResp := postJSON(t, base+"/storage/v1/b/compose-oversized/o/merged/compose", padded)
+	assertStatus(t, paddedResp, 400)
+
+	var errResp gcpError
+	decodeBody(t, paddedResp, &errResp)
+
+	if errResp.Error.Code != 400 {
+		t.Fatalf("expected code 400, got %d", errResp.Error.Code)
+	}
+	if len(errResp.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(errResp.Error.Errors))
+	}
+	if errResp.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", errResp.Error.Errors[0].Reason)
+	}
+	if errResp.Error.Errors[0].Domain != "global" {
+		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
+	}
+	if !strings.Contains(errResp.Error.Message, "exceeds the maximum size") {
+		t.Fatalf("expected a size-based rejection, got %q", errResp.Error.Message)
+	}
+
+	// An oversized source array must be refused for the same reason: the byte
+	// bound fires before the array is decoded, not after the source count is
+	// counted, so the message must still be the size-based one.
+	entries := strings.Repeat(`{"name":"part-1"},`, 70000)
+	oversized := `{"sourceObjects":[` + strings.TrimSuffix(entries, ",") + `]}`
+	if len(oversized) <= maxComposeRequestBytes {
+		t.Fatalf("expected a body larger than %d bytes, got %d", maxComposeRequestBytes, len(oversized))
+	}
+
+	oversizedResp := postJSON(t, base+"/storage/v1/b/compose-oversized/o/merged/compose", oversized)
+	assertStatus(t, oversizedResp, 400)
+
+	var arrayErr gcpError
+	decodeBody(t, oversizedResp, &arrayErr)
+	if !strings.Contains(arrayErr.Error.Message, "exceeds the maximum size") {
+		t.Fatalf("expected the byte bound to reject before decoding, got %q", arrayErr.Error.Message)
+	}
+
+	// Neither rejected request may have created the destination.
+	missingResp, err := http.Get(base + "/storage/v1/b/compose-oversized/o/merged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, missingResp, 404)
+	missingResp.Body.Close()
+
+	// The server is still responsive and still composes well-formed requests.
+	okResp := postJSON(t, base+"/storage/v1/b/compose-oversized/o/merged/compose",
+		`{"sourceObjects":[{"name":"part-1"}]}`)
+	assertStatus(t, okResp, 200)
+
+	var obj Object
+	decodeBody(t, okResp, &obj)
+	if obj.Size != "7" {
+		t.Fatalf("expected size 7, got %s", obj.Size)
 	}
 }
