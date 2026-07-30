@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -170,21 +171,24 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 		escapedPath = r.URL.EscapedPath()
 	}
 
-	// TrimPrefix leaves the value untrimmed for the pathological case of a
-	// caller escaping part of the prefix itself (ServeMux matches the decoded
-	// path, so such a request still lands here). That is deliberate: the copy
-	// marker is still found wherever it occurs, and a compose match then carries
-	// the prefix into the bucket component, which the store reports as a missing
-	// bucket rather than writing anything.
+	// ServeMux matches the escaped path, so a request that escapes part of the
+	// prefix itself — /storage/v1%2Fb/... — never reaches this dispatcher at all;
+	// it falls through to handleDefault. TrimPrefix therefore always finds the
+	// literal prefix here, and the remainder starts at the bucket component.
 	escapedRest := strings.TrimPrefix(escapedPath, "/storage/v1/b/")
 
 	// Check for copy: {bucket}/o/{src}/copyTo/b/{dstBucket}/o/{dstObj}
-	// The handler keeps receiving the decoded remainder, so copy behavior is
-	// unchanged: a literal /copyTo/b/ in the escaped path is always present in
-	// the decoded path too, since percent-decoding only rewrites %XX triplets.
+	// The handler receives the ESCAPED remainder for the same reason the branch
+	// matches on it: the source object name sits before the marker, so an
+	// encoded /copyTo/b/ inside that name decodes into a marker that PRECEDES the
+	// structural one. Handing over the decoded remainder would let the handler
+	// select that name-internal marker and copy a different source into a
+	// different bucket while still answering 200. The handler splits the escaped
+	// remainder on the structural tokens and percent-decodes each component
+	// afterwards, so an encoded slash stays part of the name it was written in.
 	if strings.Contains(escapedRest, "/copyTo/b/") {
 		if r.Method == http.MethodPost {
-			s.handleCopyObject(w, r, rest)
+			s.handleCopyObject(w, r, escapedRest)
 		} else {
 			writeError(w, http.StatusMethodNotAllowed, "methodNotAllowed", "Method not allowed")
 		}
@@ -361,21 +365,32 @@ func (s *Service) handleListObjects(w http.ResponseWriter, r *http.Request, buck
 	})
 }
 
-func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, rest string) {
+// handleCopyObject copies one object to another bucket and name.
+//
+// escapedRest is the prefix-stripped remainder in its ESCAPED form. Splitting on
+// the escaped form is what keeps object-name data out of the structural
+// decision: clients percent-encode the slashes inside an object name, so in the
+// escaped path a literal "/" is always a separator while %2F is still name data.
+// Each component is percent-decoded on its own once the structure is fixed.
+//
+// Every index below is taken from the left because bucket names cannot contain a
+// slash or a percent sign, which makes the first "/o/" — of the whole remainder
+// and of the destination part — structural by construction. The first literal
+// "/copyTo/b/" is structural for the same reason the branch that routes here
+// matches on it.
+func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, escapedRest string) {
 	// Format: {srcBucket}/o/{srcObject}/copyTo/b/{dstBucket}/o/{dstObject}
-	parts := strings.SplitN(rest, "/o/", 2)
+	parts := strings.SplitN(escapedRest, "/o/", 2)
 	if len(parts) != 2 {
 		writeBadRequest(w, "Invalid copy path")
 		return
 	}
-	srcBucket := parts[0]
 
 	copyIdx := strings.Index(parts[1], "/copyTo/b/")
 	if copyIdx < 0 {
 		writeBadRequest(w, "Invalid copy path")
 		return
 	}
-	srcObject := parts[1][:copyIdx]
 
 	dstPart := parts[1][copyIdx+len("/copyTo/b/"):]
 	dstParts := strings.SplitN(dstPart, "/o/", 2)
@@ -383,8 +398,27 @@ func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, rest 
 		writeBadRequest(w, "Invalid copy destination path")
 		return
 	}
-	dstBucket := dstParts[0]
-	dstObject := dstParts[1]
+
+	srcBucket, err := url.PathUnescape(parts[0])
+	if err != nil {
+		writeBadRequest(w, "Invalid copy path")
+		return
+	}
+	srcObject, err := url.PathUnescape(parts[1][:copyIdx])
+	if err != nil {
+		writeBadRequest(w, "Invalid copy path")
+		return
+	}
+	dstBucket, err := url.PathUnescape(dstParts[0])
+	if err != nil {
+		writeBadRequest(w, "Invalid copy destination path")
+		return
+	}
+	dstObject, err := url.PathUnescape(dstParts[1])
+	if err != nil {
+		writeBadRequest(w, "Invalid copy destination path")
+		return
+	}
 
 	obj, err := s.store.CopyObject(srcBucket, srcObject, dstBucket, dstObject)
 	if err != nil {

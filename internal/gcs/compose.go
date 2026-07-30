@@ -3,6 +3,7 @@ package gcs
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -47,6 +48,24 @@ type composeDestination struct {
 	ContentType string `json:"contentType"`
 }
 
+// writeComposeBodyError refuses a compose body through the shared 400 envelope,
+// so the client sees a well-formed GCS error rather than a truncated response.
+// An oversized body earns its own message; everything else — including a nil
+// error, which means a second JSON value decoded where end-of-body was required
+// — is reported as a malformed body.
+//
+// errors.As rather than a type assertion, because the decoder is free to wrap the
+// error the bounded reader returns; it is also nil-safe, which is what lets the
+// nil case fall through to the malformed message.
+func writeComposeBodyError(w http.ResponseWriter, err error) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		writeBadRequest(w, "The compose request body exceeds the maximum size")
+		return
+	}
+	writeBadRequest(w, "Invalid compose request body")
+}
+
 // handleComposeObject parses a prefix-stripped compose path. Source-count
 // validation precedes store access, and query parameters are ignored because
 // clients append alt=json&prettyPrint=false.
@@ -86,23 +105,41 @@ func (s *Service) handleComposeObject(w http.ResponseWriter, r *http.Request, es
 		return
 	}
 
+	// Refuse a body that declares itself over the cap before a single byte of it
+	// is read. MaxBytesReader below catches the same case, but only after
+	// transferring the whole allowance, and a chunked request declares no length
+	// at all — so this is an early exit, not the bound itself.
+	if r.ContentLength > maxComposeRequestBytes {
+		writeBadRequest(w, "The compose request body exceeds the maximum size")
+		return
+	}
+
 	// Bound the body before decoding it. The decoder stays in its default,
 	// non-strict mode so unmodeled fields such as kind, deleteSourceObjects and
 	// destination.metadata remain tolerated for client compatibility.
 	r.Body = http.MaxBytesReader(w, r.Body, maxComposeRequestBytes)
 
+	// One decoder for both reads, because the second read must resume exactly
+	// where the first stopped — including anything the first already buffered.
+	dec := json.NewDecoder(r.Body)
+
 	var req composeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// An oversized body is refused through the same shared 400 envelope, so
-		// the client sees a well-formed GCS error rather than a truncated
-		// response. errors.As rather than a type assertion, because the decoder
-		// is free to wrap the error the bounded reader returns.
-		var tooLarge *http.MaxBytesError
-		if errors.As(err, &tooLarge) {
-			writeBadRequest(w, "The compose request body exceeds the maximum size")
-			return
-		}
-		writeBadRequest(w, "Invalid compose request body")
+	if err := dec.Decode(&req); err != nil {
+		writeComposeBodyError(w, err)
+		return
+	}
+
+	// A compose body is exactly ONE JSON document, so nothing but optional
+	// whitespace may follow it. Without this read the request is only validated
+	// as far as its first value: a second document would be silently ignored
+	// (`{...}{"sourceObjects":[]}` would compose from the first), trailing garbage
+	// would pass as well-formed, and the byte cap would only ever have applied to
+	// the prefix the decoder happened to consume. io.EOF is therefore the only
+	// acceptable outcome — a nil error means a second value decoded, which is
+	// malformed too.
+	var trailing json.RawMessage
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeComposeBodyError(w, err)
 		return
 	}
 

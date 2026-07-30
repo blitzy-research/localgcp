@@ -248,6 +248,86 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected reason 'invalid', got %q", arrayErr.Error.Errors[0].Reason)
 	}
 
+	// A compose body is exactly one JSON document. A second value must be
+	// refused rather than silently ignored, because accepting it would compose
+	// from the first value while the request as a whole is malformed — and would
+	// leave the rest of the body unvalidated. The first value here is a legal
+	// request on its own, so only the end-of-body requirement can reject it.
+	twoValueResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/trailing/compose",
+		`{"sourceObjects":[{"name":"part-1"}]}{"sourceObjects":[]}`)
+	assertStatus(t, twoValueResp, 400)
+
+	var twoValueErr gcpError
+	decodeBody(t, twoValueResp, &twoValueErr)
+	if twoValueErr.Error.Code != 400 {
+		t.Fatalf("expected code 400, got %d", twoValueErr.Error.Code)
+	}
+	if len(twoValueErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(twoValueErr.Error.Errors))
+	}
+	if twoValueErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", twoValueErr.Error.Errors[0].Reason)
+	}
+	if twoValueErr.Error.Errors[0].Domain != "global" {
+		t.Fatalf("expected domain 'global', got %q", twoValueErr.Error.Errors[0].Domain)
+	}
+
+	// Trailing bytes that are not JSON at all are refused the same way.
+	garbageResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/trailing/compose",
+		`{"sourceObjects":[{"name":"part-1"}]} then some trailing text`)
+	assertStatus(t, garbageResp, 400)
+
+	var garbageErr gcpError
+	decodeBody(t, garbageResp, &garbageErr)
+	if garbageErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", garbageErr.Error.Errors[0].Reason)
+	}
+
+	// The byte bound covers the WHOLE body, not just the first document: a legal
+	// request followed by over-cap padding is refused as oversized even though
+	// the document itself is well within the cap.
+	const firstDoc = `{"sourceObjects":[{"name":"part-1"}]}`
+	overTrailing := firstDoc + strings.Repeat(" ", maxComposeRequestBytes)
+	if len(overTrailing) <= maxComposeRequestBytes {
+		t.Fatalf("expected a body larger than %d bytes, got %d", maxComposeRequestBytes, len(overTrailing))
+	}
+
+	overTrailingResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/trailing/compose", overTrailing)
+	assertStatus(t, overTrailingResp, 400)
+
+	var overTrailingErr gcpError
+	decodeBody(t, overTrailingResp, &overTrailingErr)
+	if len(overTrailingErr.Error.Errors) != 1 {
+		t.Fatalf("expected 1 error detail, got %d", len(overTrailingErr.Error.Errors))
+	}
+	if overTrailingErr.Error.Errors[0].Reason != "invalid" {
+		t.Fatalf("expected reason 'invalid', got %q", overTrailingErr.Error.Errors[0].Reason)
+	}
+	if !strings.Contains(overTrailingErr.Error.Message, "exceeds the maximum size") {
+		t.Fatalf("expected the oversized-body message, got %q", overTrailingErr.Error.Message)
+	}
+
+	// None of the three rejected bodies composed anything.
+	trailingResp, err := http.Get(base + "/storage/v1/b/compose-empty/o/trailing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, trailingResp, 404)
+	trailingResp.Body.Close()
+
+	// A whitespace-only trailer is NOT a second value and must still be accepted:
+	// the official client encodes its body with json.Encoder, which appends a
+	// newline, so rejecting trailing whitespace would break every real client.
+	whitespaceResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/trailing-ok/compose",
+		firstDoc+"\n\n \t\r\n")
+	assertStatus(t, whitespaceResp, 200)
+
+	var whitespaceObj Object
+	decodeBody(t, whitespaceResp, &whitespaceObj)
+	if whitespaceObj.Size != "7" {
+		t.Fatalf("expected size 7, got %s", whitespaceObj.Size)
+	}
+
 	// Neither oversized body may have modified the destination the accepted
 	// request composed.
 	mediaResp, err := http.Get(base + "/storage/v1/b/compose-empty/o/merged?alt=media")
@@ -784,6 +864,94 @@ func TestComposeObjectRawEscapedPath(t *testing.T) {
 	decodeBody(t, listResp, &list)
 	if len(list.Items) != 0 {
 		t.Fatalf("expected no cross-bucket write, got %d object(s) in compose-raw-decoy", len(list.Items))
+	}
+}
+
+// TestCopyObjectEncodedSourceName is the other half of the escaped-path dispatch
+// contract, which is why it lives beside the compose tests: the same escaped
+// remainder that keeps a compose destination out of the copy branch is what the
+// copy handler must parse. A copy source name may legally contain "/copyTo/b/",
+// and a client sends those slashes percent-encoded. On the decoded path that
+// name-internal marker PRECEDES the structural one, so parsing the decoded
+// remainder selected the wrong source and wrote it into the bucket and object
+// named inside the source name — while still answering 200. The assertions below
+// pin the exact source that was read and the exact destination that was written,
+// and prove the bucket named inside the source name was never touched.
+func TestCopyObjectEncodedSourceName(t *testing.T) {
+	base := testServer(t)
+
+	for _, bucket := range []string{"copy-encoded-src", "copy-encoded-dst", "copy-encoded-decoy"} {
+		resp := postJSON(t, base+"/storage/v1/b?project=test", fmt.Sprintf(`{"name":%q}`, bucket))
+		assertStatus(t, resp, 200)
+		resp.Body.Close()
+	}
+
+	// The source carries the copy marker as data and names the decoy bucket a
+	// misparse would have written into.
+	const srcName = "prefix/copyTo/b/copy-encoded-decoy/o/target"
+	simpleUpload(t, base, "copy-encoded-src", srcName, "real source content")
+	// "prefix" is the source a misparse read instead. Its 20 bytes differ from
+	// the real source's 19, so the copied size alone identifies which was read.
+	simpleUpload(t, base, "copy-encoded-src", "prefix", "decoy source content")
+
+	copyResp := postJSON(t,
+		base+"/storage/v1/b/copy-encoded-src/o/"+url.PathEscape(srcName)+
+			"/copyTo/b/copy-encoded-dst/o/"+url.PathEscape("intended/out"),
+		"{}")
+	assertStatus(t, copyResp, 200)
+
+	var copied Object
+	decodeBody(t, copyResp, &copied)
+	if copied.Bucket != "copy-encoded-dst" || copied.Name != "intended/out" {
+		t.Fatalf("expected copy to copy-encoded-dst/intended/out, got %s/%s", copied.Bucket, copied.Name)
+	}
+	if copied.Size != "19" {
+		t.Fatalf("expected the real source's size 19, got %s", copied.Size)
+	}
+
+	// The copy is readable under exactly the requested destination name, with the
+	// bytes of the source that was actually named.
+	mediaResp, err := http.Get(base + "/storage/v1/b/copy-encoded-dst/o/" +
+		url.PathEscape("intended/out") + "?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, mediaResp, 200)
+	body, _ := io.ReadAll(mediaResp.Body)
+	mediaResp.Body.Close()
+	if string(body) != "real source content" {
+		t.Fatalf("expected 'real source content', got %q", string(body))
+	}
+
+	// The bucket named inside the source name was never written to.
+	listResp, err := http.Get(base + "/storage/v1/b/copy-encoded-decoy/o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, listResp, 200)
+
+	var list ObjectList
+	decodeBody(t, listResp, &list)
+	if len(list.Items) != 0 {
+		t.Fatalf("expected no cross-bucket write, got %d object(s) in copy-encoded-decoy", len(list.Items))
+	}
+
+	// A destination name carrying the same marker as data round-trips too, so the
+	// structural token is selected on both sides of it.
+	const dstName = "out/copyTo/b/copy-encoded-decoy/o/other"
+	dstResp := postJSON(t,
+		base+"/storage/v1/b/copy-encoded-src/o/prefix/copyTo/b/copy-encoded-dst/o/"+
+			url.PathEscape(dstName),
+		"{}")
+	assertStatus(t, dstResp, 200)
+
+	var dstCopied Object
+	decodeBody(t, dstResp, &dstCopied)
+	if dstCopied.Bucket != "copy-encoded-dst" || dstCopied.Name != dstName {
+		t.Fatalf("expected copy to copy-encoded-dst/%s, got %s/%s", dstName, dstCopied.Bucket, dstCopied.Name)
+	}
+	if dstCopied.Size != "20" {
+		t.Fatalf("expected the decoy source's size 20, got %s", dstCopied.Size)
 	}
 }
 
