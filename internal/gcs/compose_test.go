@@ -1,9 +1,12 @@
 package gcs
 
 import (
+	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -586,4 +589,225 @@ func TestComposeObjectMethodNotAllowed(t *testing.T) {
 	}
 	assertStatus(t, strayResp, 404)
 	strayResp.Body.Close()
+}
+
+// TestComposeObjectEncodedDestinationName covers destination names in the escaped
+// form official clients actually send: url.PathEscape mirrors how a client
+// escapes a path parameter, turning every slash inside the name into %2F.
+//
+// Go's HTTP server percent-decodes the path before the router sees it, so on the
+// decoded path a name containing "/copyTo/b/" is indistinguishable from a copy
+// sub-operation and a name ending in "/compose" from the compose token itself.
+// Dispatching on the escaped path is what keeps those apart: the request below
+// used to be served as a cross-bucket copy that answered 200 without composing
+// anything, so the assertions cover both the composite and the objects a copy
+// would have touched. The copy route itself must keep working, including a copy
+// destination that ends in "/compose".
+func TestComposeObjectEncodedDestinationName(t *testing.T) {
+	base := testServer(t)
+
+	for _, bucket := range []string{"compose-encoded", "compose-decoy"} {
+		resp := postJSON(t, base+"/storage/v1/b?project=test", fmt.Sprintf(`{"name":%q}`, bucket))
+		assertStatus(t, resp, 200)
+		resp.Body.Close()
+	}
+
+	simpleUpload(t, base, "compose-encoded", "part-1", "Hello, ")
+	simpleUpload(t, base, "compose-encoded", "part-2", "world")
+	// "nested" is the source a copy misparsed out of the destination name below,
+	// so its bytes surviving unchanged proves no copy was performed.
+	simpleUpload(t, base, "compose-encoded", "nested", "decoy source content")
+
+	// The destination name carries the copy marker as data, and names the decoy
+	// bucket a misparse would have written into.
+	const dstName = "nested/copyTo/b/compose-decoy/o/merged"
+	composeResp := postJSON(t,
+		base+"/storage/v1/b/compose-encoded/o/"+url.PathEscape(dstName)+"/compose?alt=json&prettyPrint=false",
+		`{"sourceObjects":[{"name":"part-1"},{"name":"part-2"}]}`)
+	assertStatus(t, composeResp, 200)
+
+	var obj Object
+	decodeBody(t, composeResp, &obj)
+	if obj.Name != dstName {
+		t.Fatalf("expected name %q, got %q", dstName, obj.Name)
+	}
+	if obj.Bucket != "compose-encoded" {
+		t.Fatalf("expected bucket 'compose-encoded', got %q", obj.Bucket)
+	}
+	if obj.Size != "12" {
+		t.Fatalf("expected size 12, got %s", obj.Size)
+	}
+
+	// The composite is readable under exactly the name that was requested.
+	mediaResp, err := http.Get(base + "/storage/v1/b/compose-encoded/o/" + url.PathEscape(dstName) + "?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, mediaResp, 200)
+	body, _ := io.ReadAll(mediaResp.Body)
+	mediaResp.Body.Close()
+	if string(body) != "Hello, world" {
+		t.Fatalf("expected 'Hello, world', got %q", string(body))
+	}
+
+	// The object a copy would have read is untouched.
+	decoyResp, err := http.Get(base + "/storage/v1/b/compose-encoded/o/nested?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, decoyResp, 200)
+	decoyBody, _ := io.ReadAll(decoyResp.Body)
+	decoyResp.Body.Close()
+	if string(decoyBody) != "decoy source content" {
+		t.Fatalf("expected the decoy source to keep its bytes, got %q", string(decoyBody))
+	}
+
+	// And the bucket named inside the destination was never written to.
+	listResp, err := http.Get(base + "/storage/v1/b/compose-decoy/o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, listResp, 200)
+
+	var list ObjectList
+	decodeBody(t, listResp, &list)
+	if len(list.Items) != 0 {
+		t.Fatalf("expected no cross-bucket write, got %d object(s) in compose-decoy", len(list.Items))
+	}
+
+	// A destination whose own last segment is "compose" keeps it: only the
+	// structural token is stripped.
+	tailResp := postJSON(t,
+		base+"/storage/v1/b/compose-encoded/o/"+url.PathEscape("dir/compose")+"/compose",
+		`{"sourceObjects":[{"name":"part-1"}]}`)
+	assertStatus(t, tailResp, 200)
+
+	var tail Object
+	decodeBody(t, tailResp, &tail)
+	if tail.Name != "dir/compose" {
+		t.Fatalf("expected name 'dir/compose', got %q", tail.Name)
+	}
+
+	// The same escaped name without the structural token is not a compose
+	// request, so it keeps the pre-existing 405 and composes nothing.
+	notComposeResp := postJSON(t, base+"/storage/v1/b/compose-encoded/o/"+url.PathEscape("dir/compose"),
+		`{"sourceObjects":[{"name":"part-1"}]}`)
+	assertStatus(t, notComposeResp, 405)
+	notComposeResp.Body.Close()
+
+	strayResp, err := http.Get(base + "/storage/v1/b/compose-encoded/o/dir")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, strayResp, 404)
+	strayResp.Body.Close()
+
+	// Genuine copy requests still reach the copy handler, including one whose
+	// destination ends in "/compose".
+	copyResp := postJSON(t,
+		base+"/storage/v1/b/compose-encoded/o/part-1/copyTo/b/compose-decoy/o/"+url.PathEscape("copied/compose"),
+		"{}")
+	assertStatus(t, copyResp, 200)
+
+	var copied Object
+	decodeBody(t, copyResp, &copied)
+	if copied.Bucket != "compose-decoy" || copied.Name != "copied/compose" {
+		t.Fatalf("expected copy to compose-decoy/copied/compose, got %s/%s", copied.Bucket, copied.Name)
+	}
+	if copied.Size != "7" {
+		t.Fatalf("expected the copied size 7, got %s", copied.Size)
+	}
+}
+
+// TestComposeObjectRawEscapedPath pins the escaped path the router dispatches on
+// to r.URL.RawPath. When the request target also carries a character net/url
+// would have escaped itself — a literal "|" here — RawPath is no longer a
+// "valid encoding" in net/url's eyes, so EscapedPath() falls back to re-encoding
+// the already-decoded r.URL.Path. That re-encoding turns the destination name's
+// %2F back into separators and would hand the request to the copy branch again,
+// which is why the verbatim RawPath is preferred whenever it is present.
+func TestComposeObjectRawEscapedPath(t *testing.T) {
+	base := testServer(t)
+
+	for _, bucket := range []string{"compose-raw", "compose-raw-decoy"} {
+		resp := postJSON(t, base+"/storage/v1/b?project=test", fmt.Sprintf(`{"name":%q}`, bucket))
+		assertStatus(t, resp, 200)
+		resp.Body.Close()
+	}
+
+	simpleUpload(t, base, "compose-raw", "part-1", "Hello, ")
+	simpleUpload(t, base, "compose-raw", "part-2", "world")
+	simpleUpload(t, base, "compose-raw", "nested", "decoy source content")
+
+	// The trailing "|" is appended unescaped, the way a client that escapes only
+	// the reserved characters would send it; everything before it is escaped
+	// exactly as an official client escapes a path parameter.
+	const dstName = "nested/copyTo/b/compose-raw-decoy/o/merged|"
+	target := "/storage/v1/b/compose-raw/o/" +
+		url.PathEscape("nested/copyTo/b/compose-raw-decoy/o/merged") + "|/compose"
+
+	composeResp := rawPost(t, base, target, `{"sourceObjects":[{"name":"part-1"},{"name":"part-2"}]}`)
+	assertStatus(t, composeResp, 200)
+
+	var obj Object
+	decodeBody(t, composeResp, &obj)
+	if obj.Name != dstName {
+		t.Fatalf("expected name %q, got %q", dstName, obj.Name)
+	}
+	if obj.Bucket != "compose-raw" {
+		t.Fatalf("expected bucket 'compose-raw', got %q", obj.Bucket)
+	}
+	if obj.Size != "12" {
+		t.Fatalf("expected size 12, got %s", obj.Size)
+	}
+
+	// No copy took place: the object a misparse would have read is unchanged.
+	decoyResp, err := http.Get(base + "/storage/v1/b/compose-raw/o/nested?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, decoyResp, 200)
+	decoyBody, _ := io.ReadAll(decoyResp.Body)
+	decoyResp.Body.Close()
+	if string(decoyBody) != "decoy source content" {
+		t.Fatalf("expected the decoy source to keep its bytes, got %q", string(decoyBody))
+	}
+
+	// And the bucket named inside the destination was never written to.
+	listResp, err := http.Get(base + "/storage/v1/b/compose-raw-decoy/o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, listResp, 200)
+
+	var list ObjectList
+	decodeBody(t, listResp, &list)
+	if len(list.Items) != 0 {
+		t.Fatalf("expected no cross-bucket write, got %d object(s) in compose-raw-decoy", len(list.Items))
+	}
+}
+
+// rawPost writes a request target verbatim, so characters net/http's client
+// would re-escape on the way out survive into the server's request line. The
+// parsed response is returned so the shared assertion helpers still apply.
+func rawPost(t *testing.T, base, target, body string) *http.Response {
+	t.Helper()
+
+	conn, err := net.Dial("tcp", strings.TrimPrefix(base, "http://"))
+	if err != nil {
+		t.Fatalf("dial %s: %v", base, err)
+	}
+	t.Cleanup(func() { conn.Close() })
+
+	req := fmt.Sprintf("POST %s HTTP/1.1\r\nHost: localgcp\r\nContent-Type: application/json\r\n"+
+		"Content-Length: %d\r\nConnection: close\r\n\r\n%s", target, len(body), body)
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatalf("write raw request: %v", err)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("read raw response: %v", err)
+	}
+	return resp
 }

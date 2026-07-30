@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -49,21 +50,39 @@ type composeDestination struct {
 // handleComposeObject parses a prefix-stripped compose path. Source-count
 // validation precedes store access, and query parameters are ignored because
 // clients append alt=json&prettyPrint=false.
-func (s *Service) handleComposeObject(w http.ResponseWriter, r *http.Request, rest string) {
+//
+// escapedRest is the remainder in its ESCAPED form. The decoded form cannot be
+// used: r.URL.Path has already turned every %2F into "/", which makes a
+// destination name that contains "/copyTo/b/" or ends in "/compose"
+// indistinguishable from a structural sub-operation. Keeping the escapes lets
+// the structural tokens be matched first, after which each component is
+// percent-decoded on its own — so an encoded slash stays part of the name it was
+// written in rather than becoming a separator.
+func (s *Service) handleComposeObject(w http.ResponseWriter, r *http.Request, escapedRest string) {
 	// Format: {bucket}/o/{destinationObject}/compose — the destination name may
 	// itself contain slashes, so split only on the first /o/.
-	parts := strings.SplitN(rest, "/o/", 2)
+	parts := strings.SplitN(escapedRest, "/o/", 2)
 	if len(parts) != 2 || parts[0] == "" {
 		writeBadRequest(w, "Invalid compose path")
 		return
 	}
-	bucket := parts[0]
+	bucket, err := url.PathUnescape(parts[0])
+	if err != nil {
+		writeBadRequest(w, "Invalid compose path")
+		return
+	}
 
-	// Strip only the trailing token, so a destination legitimately named
-	// "x/compose" still resolves.
-	dstName := strings.TrimSuffix(parts[1], "/compose")
-	if dstName == "" {
+	// Strip only the trailing structural token, so a destination legitimately
+	// named "x/compose" — which a client sends as "x%2Fcompose/compose" — still
+	// resolves to "x/compose".
+	escapedName := strings.TrimSuffix(parts[1], "/compose")
+	if escapedName == "" {
 		writeBadRequest(w, "Destination object name is required")
+		return
+	}
+	dstName, err := url.PathUnescape(escapedName)
+	if err != nil {
+		writeBadRequest(w, "Invalid destination object name")
 		return
 	}
 

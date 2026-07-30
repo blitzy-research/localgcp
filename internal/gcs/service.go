@@ -147,8 +147,42 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	// Strip prefix to get: {bucket} or {bucket}/o or {bucket}/o/{object...}
 	rest := strings.TrimPrefix(path, "/storage/v1/b/")
 
+	// The sub-operation suffixes below are matched against the ESCAPED path
+	// instead of the decoded one, because r.URL.Path has already turned every
+	// %2F into "/". Clients percent-encode the slashes inside an object name, so
+	// on the decoded path a destination such as "nested/copyTo/b/other/o/name"
+	// is indistinguishable from a genuine copy sub-operation and a compose
+	// request would be executed as a cross-bucket copy. In the escaped path a
+	// literal "/" is always a separator while %2F is still object-name data, so
+	// the two can no longer be confused; the compose handler percent-decodes
+	// each component once the structural split has been made.
+	//
+	// RawPath holds the request path verbatim whenever it differs from the
+	// canonical encoding of Path, which is precisely the case when an object name
+	// carries %2F. It is preferred over EscapedPath() because EscapedPath()
+	// re-encodes Path whenever the raw form contains a character it would have
+	// escaped itself — a literal "|" for instance — and that re-encoding turns
+	// the encoded slashes back into separators, reinstating the ambiguity. When
+	// RawPath is empty the request carried no such escapes, so the canonical
+	// encoding EscapedPath() returns is exact.
+	escapedPath := r.URL.RawPath
+	if escapedPath == "" {
+		escapedPath = r.URL.EscapedPath()
+	}
+
+	// TrimPrefix leaves the value untrimmed for the pathological case of a
+	// caller escaping part of the prefix itself (ServeMux matches the decoded
+	// path, so such a request still lands here). That is deliberate: the copy
+	// marker is still found wherever it occurs, and a compose match then carries
+	// the prefix into the bucket component, which the store reports as a missing
+	// bucket rather than writing anything.
+	escapedRest := strings.TrimPrefix(escapedPath, "/storage/v1/b/")
+
 	// Check for copy: {bucket}/o/{src}/copyTo/b/{dstBucket}/o/{dstObj}
-	if strings.Contains(rest, "/copyTo/b/") {
+	// The handler keeps receiving the decoded remainder, so copy behavior is
+	// unchanged: a literal /copyTo/b/ in the escaped path is always present in
+	// the decoded path too, since percent-decoding only rewrites %XX triplets.
+	if strings.Contains(escapedRest, "/copyTo/b/") {
 		if r.Method == http.MethodPost {
 			s.handleCopyObject(w, r, rest)
 		} else {
@@ -163,8 +197,8 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	// {bucket}/compose — keeps falling through to its pre-existing 405 instead of
 	// being claimed here.
 	if r.Method == http.MethodPost {
-		if i := strings.Index(rest, "/o/"); i >= 0 && strings.HasSuffix(rest[i+3:], "/compose") {
-			s.handleComposeObject(w, r, rest)
+		if i := strings.Index(escapedRest, "/o/"); i >= 0 && strings.HasSuffix(escapedRest[i+3:], "/compose") {
+			s.handleComposeObject(w, r, escapedRest)
 			return
 		}
 	}
