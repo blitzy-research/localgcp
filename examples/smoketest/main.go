@@ -141,6 +141,71 @@ func testGCS(ctx context.Context) {
 		check("List objects (count=1)", fmt.Errorf("got %d objects", count))
 	}
 
+	// Compose objects (server-side concatenation). Sequenced after the count
+	// assertion above so that assertion still sees exactly one object, and every
+	// object created here is deleted again below — the emulator refuses to delete
+	// a non-empty bucket.
+	w1 := bucket.Object("part-1.txt").NewWriter(ctx)
+	w1.ContentType = "text/plain"
+	_, err = w1.Write([]byte("Hello, "))
+	if err == nil {
+		err = w1.Close()
+	}
+	check("Upload compose part 1", err)
+
+	w2 := bucket.Object("part-2.txt").NewWriter(ctx)
+	w2.ContentType = "text/plain"
+	_, err = w2.Write([]byte("world"))
+	if err == nil {
+		err = w2.Close()
+	}
+	check("Upload compose part 2", err)
+
+	// ComposerFrom issues the single objects.compose call that Python's
+	// Blob.compose and Node's Bucket.combine also reduce to, so one round trip
+	// covers the wire contract every official client depends on.
+	composed := "Hello, world"
+	dst := bucket.Object("merged.txt")
+	attrs, err := dst.ComposerFrom(bucket.Object("part-1.txt"), bucket.Object("part-2.txt")).Run(ctx)
+	if check("Compose objects", err) {
+		if attrs.Size == int64(len(composed)) {
+			check("Compose objects (size)", nil)
+		} else {
+			check("Compose objects (size)", fmt.Errorf("got %d, want %d", attrs.Size, len(composed)))
+		}
+		// No destination content type was requested, so the composite inherits
+		// the first source's.
+		if attrs.ContentType == "text/plain" {
+			check("Compose objects (content type)", nil)
+		} else {
+			check("Compose objects (content type)",
+				fmt.Errorf("got %q, want %q", attrs.ContentType, "text/plain"))
+		}
+	}
+
+	// Read the composite back; the Go client reads through the XML API path.
+	cr, err := dst.NewReader(ctx)
+	if check("Compose read back (open)", err) {
+		merged, err := io.ReadAll(cr)
+		cr.Close()
+		if check("Compose read back (read)", err) {
+			if string(merged) == composed {
+				check("Compose read back (content match)", nil)
+			} else {
+				check("Compose read back (content match)",
+					fmt.Errorf("got %q, want %q", string(merged), composed))
+			}
+		}
+	}
+
+	// Clean up the compose objects so the bucket is empty before it is deleted.
+	err = bucket.Object("part-1.txt").Delete(ctx)
+	check("Delete compose part 1", err)
+	err = bucket.Object("part-2.txt").Delete(ctx)
+	check("Delete compose part 2", err)
+	err = dst.Delete(ctx)
+	check("Delete composed object", err)
+
 	// Delete object.
 	err = bucket.Object("hello.txt").Delete(ctx)
 	check("Delete object", err)
