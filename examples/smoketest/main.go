@@ -394,9 +394,12 @@ func testFirestore(ctx context.Context) {
 		}
 	}
 
-	// Create more docs for querying.
-	col.Add(ctx, map[string]interface{}{"name": "Bob", "age": 25, "city": "Portland"})
-	col.Add(ctx, map[string]interface{}{"name": "Charlie", "age": 35, "city": "Seattle"})
+	// Create more docs for querying. Their auto-generated refs are kept so the
+	// cleanup below can delete them: the queries assert on how many documents
+	// the collection holds, so anything this run leaves behind would be counted
+	// again the next time the harness runs against the same emulator.
+	bobDoc, _, _ := col.Add(ctx, map[string]interface{}{"name": "Bob", "age": 25, "city": "Portland"})
+	charlieDoc, _, _ := col.Add(ctx, map[string]interface{}{"name": "Charlie", "age": 35, "city": "Seattle"})
 
 	// Query: city == "Seattle"
 	iter := col.Where("city", "==", "Seattle").Documents(ctx)
@@ -446,10 +449,18 @@ func testFirestore(ctx context.Context) {
 			fmt.Errorf("got ages=%v", ages))
 	}
 
-	// Delete docs.
+	// Delete docs. Every document created above is removed — including the two
+	// query documents — so the collection is left exactly as it was found and
+	// the harness stays repeatable against a long-lived emulator.
 	if doc != nil {
 		_, err = doc.Delete(ctx)
 		check("Delete document", err)
+	}
+	if bobDoc != nil {
+		bobDoc.Delete(ctx)
+	}
+	if charlieDoc != nil {
+		charlieDoc.Delete(ctx)
 	}
 
 	fmt.Println()
