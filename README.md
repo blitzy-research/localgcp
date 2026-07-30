@@ -139,7 +139,7 @@ Your GCP client libraries work against localgcp with zero code changes (except S
 ### Cloud Storage
 - Bucket CRUD (create, get, list, delete)
 - Object upload (simple, multipart, resumable)
-- Object download, metadata, delete, copy
+- Object download, metadata, delete, copy, compose
 - Object listing with prefix and delimiter (directory-like browsing)
 - Signed URL generation and download
 - Works with both JSON API and XML API paths
@@ -267,7 +267,7 @@ GCP client libraries already support `*_EMULATOR_HOST` environment variables. Wh
 
 ## What's NOT included (yet)
 
-- Cloud Storage: bucket versioning, object compose, IAM policies
+- Cloud Storage: bucket versioning, IAM policies
 - Pub/Sub: exactly-once delivery, message ordering
 - Firestore: composite indexes, collection group queries
 - Cloud Tasks: App Engine task targets, OIDC/OAuth authentication
