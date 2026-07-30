@@ -147,8 +147,35 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	// Strip prefix to get: {bucket} or {bucket}/o or {bucket}/o/{object...}
 	rest := strings.TrimPrefix(path, "/storage/v1/b/")
 
+	// The two sub-operation branches below decide STRUCTURE on the escaped path,
+	// because r.URL.Path has already decoded every %2F into "/". Clients
+	// percent-encode the slashes inside an object name, so on the decoded
+	// remainder a destination legitimately named "nested/copyTo/b/other/o/name"
+	// is indistinguishable from a genuine copy sub-operation and its compose
+	// request would be executed as a cross-bucket copy. In the escaped form a
+	// literal "/" is always a separator while %2F is still object-name data, so
+	// name data can no longer be mistaken for a structural token.
+	//
+	// RawPath holds the request path verbatim whenever it differs from the
+	// canonical encoding of Path — exactly when an object name carries escapes.
+	// It is preferred over EscapedPath(), which re-encodes the already-decoded
+	// Path whenever RawPath contains a character it would have escaped itself,
+	// turning those encoded slashes back into separators; when RawPath is empty
+	// the request carried no such escapes, so EscapedPath() is exact. ServeMux
+	// matches the escaped path, so a request that escapes part of the prefix
+	// itself never reaches this dispatcher and TrimPrefix always finds the
+	// literal prefix here.
+	//
+	// Only the branch conditions read this form. Both handlers still receive the
+	// decoded remainder, so percent-encoded slashes need no handling downstream.
+	escapedRest := r.URL.RawPath
+	if escapedRest == "" {
+		escapedRest = r.URL.EscapedPath()
+	}
+	escapedRest = strings.TrimPrefix(escapedRest, "/storage/v1/b/")
+
 	// Check for copy: {bucket}/o/{src}/copyTo/b/{dstBucket}/o/{dstObj}
-	if strings.Contains(rest, "/copyTo/b/") {
+	if strings.Contains(escapedRest, "/copyTo/b/") {
 		if r.Method == http.MethodPost {
 			s.handleCopyObject(w, r, rest)
 		} else {
@@ -163,7 +190,7 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	// {bucket}/compose — keeps falling through to its pre-existing 405 instead of
 	// being claimed here.
 	if r.Method == http.MethodPost {
-		if i := strings.Index(rest, "/o/"); i >= 0 && strings.HasSuffix(rest[i+3:], "/compose") {
+		if i := strings.Index(escapedRest, "/o/"); i >= 0 && strings.HasSuffix(escapedRest[i+3:], "/compose") {
 			s.handleComposeObject(w, r, rest)
 			return
 		}
