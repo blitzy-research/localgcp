@@ -16,11 +16,6 @@ import (
 // rejects a zero-source composer before it sends anything, which would make the
 // empty-sourceObjects contract impossible to exercise.
 
-// TestComposeObject is the acceptance test: two uploaded parts concatenate in
-// order into one destination with the expected object metadata. It also covers
-// the two reachable levels of the content-type fallback and confirms the
-// accepted-but-ignored body fields (kind, destination.metadata,
-// deleteSourceObjects) do not break the request.
 func TestComposeObject(t *testing.T) {
 	base := testServer(t)
 
@@ -50,15 +45,13 @@ func TestComposeObject(t *testing.T) {
 	if obj.ID != "compose-bucket/merged" {
 		t.Fatalf("expected id 'compose-bucket/merged', got %q", obj.ID)
 	}
-	// 7 bytes of "Hello, " plus 5 bytes of "world"; Size is a string.
 	if obj.Size != "12" {
 		t.Fatalf("expected size 12, got %s", obj.Size)
 	}
 	if obj.Md5Hash == "" {
 		t.Fatalf("expected recomputed md5Hash, got empty")
 	}
-	// The hash covers the concatenated bytes rather than being inherited from a
-	// source object.
+	// The destination hash must not be inherited from a source object.
 	if obj.Md5Hash == first.Md5Hash {
 		t.Fatalf("md5Hash was not recomputed: still %q", obj.Md5Hash)
 	}
@@ -98,12 +91,9 @@ func TestComposeObject(t *testing.T) {
 	}
 }
 
-// TestComposeObjectEmptySources checks the malformed-input paths the handler
-// refuses before it ever reaches the store: an empty source list, a body that is
-// not valid JSON, a source entry with no name, a body past the byte bound, and a
-// body that is not exactly one JSON document. Each returns the shared GCS 400
-// error envelope, none of them may create or modify the destination, and the
-// server keeps serving well-formed requests afterwards.
+// TestComposeObjectEmptySources covers body-level 400 validation, verifies
+// rejected bodies do not create or modify the destination, and confirms recovery
+// with a later valid request.
 func TestComposeObjectEmptySources(t *testing.T) {
 	base := testServer(t)
 
@@ -131,7 +121,6 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
 
-	// A body that is not valid JSON fails to decode and is refused the same way.
 	malformedResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
 		`{"sourceObjects":[{"name":"part-1"}`)
 	assertStatus(t, malformedResp, 400)
@@ -151,7 +140,6 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", malformedErr.Error.Errors[0].Domain)
 	}
 
-	// An unnamed source cannot be resolved, so it is refused before the store too.
 	unnamedResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/merged/compose",
 		`{"sourceObjects":[{"name":"part-1"},{"name":""}]}`)
 	assertStatus(t, unnamedResp, 400)
@@ -176,12 +164,8 @@ func TestComposeObjectEmptySources(t *testing.T) {
 	assertStatus(t, missingResp, 404)
 	missingResp.Body.Close()
 
-	// The body is bounded by byte count before it is decoded. The source-count
-	// check cannot do that on its own, because it can only run once the whole
-	// sourceObjects array has already been materialized. The two bodies below name
-	// one legal source and one accepted-and-ignored field, so they are
-	// semantically identical and differ only in length: only a byte bound can
-	// explain the first composing and the second being refused.
+	// Source-count validation cannot bound decoder allocation. These equivalent
+	// requests differ only in body size and pin the byte-limit boundary.
 	simpleUpload(t, base, "compose-empty", "part-1", "Hello, ")
 
 	const padTemplate = `{"sourceObjects":[{"name":"part-1"}],"destination":{"metadata":{"pad":%q}}}`
@@ -227,8 +211,6 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected the oversized-body message, got %q", overLimitErr.Error.Message)
 	}
 
-	// An oversized sourceObjects array is refused by the same bound, so the cost
-	// of decoding it never depends on how many entries it claims to carry.
 	oversizedArray := `{"sourceObjects":[` +
 		strings.TrimSuffix(strings.Repeat(`{"name":"part-1"},`, 70000), ",") + `]}`
 	if len(oversizedArray) <= maxComposeRequestBytes {
@@ -250,11 +232,8 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected reason 'invalid', got %q", arrayErr.Error.Errors[0].Reason)
 	}
 
-	// A compose body is exactly one JSON document. A second value must be refused
-	// rather than silently ignored, because accepting it would compose from the
-	// first value while the request as a whole is malformed — and would leave the
-	// rest of the body unvalidated. The first value here is a legal request on its
-	// own, so only the end-of-body requirement can reject it.
+	// Reject a second JSON value; the first value is valid on its own, so only the
+	// end-of-body check can produce this 400.
 	twoValueResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/trailing/compose",
 		`{"sourceObjects":[{"name":"part-1"}]}{"sourceObjects":[]}`)
 	assertStatus(t, twoValueResp, 400)
@@ -274,7 +253,6 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", twoValueErr.Error.Errors[0].Domain)
 	}
 
-	// Trailing bytes that are not JSON at all are refused the same way.
 	garbageResp := postJSON(t, base+"/storage/v1/b/compose-empty/o/trailing/compose",
 		`{"sourceObjects":[{"name":"part-1"}]} then some trailing text`)
 	assertStatus(t, garbageResp, 400)
@@ -285,9 +263,7 @@ func TestComposeObjectEmptySources(t *testing.T) {
 		t.Fatalf("expected reason 'invalid', got %q", garbageErr.Error.Errors[0].Reason)
 	}
 
-	// The byte bound covers the WHOLE body, not just the first document: a legal
-	// request followed by over-cap padding is refused as oversized even though the
-	// document itself is well within the cap.
+	// The byte cap applies to the entire body, including padding after a valid document.
 	const firstDoc = `{"sourceObjects":[{"name":"part-1"}]}`
 	overTrailing := firstDoc + strings.Repeat(" ", maxComposeRequestBytes)
 	if len(overTrailing) <= maxComposeRequestBytes {
@@ -393,7 +369,6 @@ func TestComposeObjectTooManySources(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
 
-	// The rejected request must not have created the destination.
 	missingResp, err := http.Get(base + "/storage/v1/b/compose-limit/o/too-many")
 	if err != nil {
 		t.Fatal(err)
@@ -475,7 +450,6 @@ func TestComposeObjectSourceNotFound(t *testing.T) {
 		t.Fatalf("expected destination to keep 'original content', got %q", string(body))
 	}
 
-	// The source that did resolve must still be intact as well.
 	srcResp, err := http.Get(base + "/storage/v1/b/compose-missing-source/o/part-1?alt=media")
 	if err != nil {
 		t.Fatal(err)
@@ -488,8 +462,6 @@ func TestComposeObjectSourceNotFound(t *testing.T) {
 	}
 }
 
-// TestComposeObjectBucketNotFound checks that composing into a bucket that does
-// not exist yields 404 rather than creating it.
 func TestComposeObjectBucketNotFound(t *testing.T) {
 	base := testServer(t)
 
@@ -521,12 +493,8 @@ func TestComposeObjectBucketNotFound(t *testing.T) {
 	bucketResp.Body.Close()
 }
 
-// TestComposeObjectWithSlashesInName checks that a destination name containing
-// slashes survives path parsing intact, since the name is authoritative from the
-// URL and only the trailing /compose token is stripped. It covers both forms such
-// a name arrives in: unescaped slashes, and the percent-escaped form official
-// clients actually send — including a name whose own bytes spell a structural
-// sub-operation token, which must be treated as data rather than as a copy.
+// TestComposeObjectWithSlashesInName verifies both literal and percent-escaped
+// slash-bearing destinations, including names containing copy-operation tokens.
 func TestComposeObjectWithSlashesInName(t *testing.T) {
 	base := testServer(t)
 
@@ -566,17 +534,9 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 		t.Fatalf("expected 'Hello, world', got %q", string(body))
 	}
 
-	// url.PathEscape mirrors how an official client escapes a path parameter,
-	// turning every slash inside the destination name into %2F. Go's HTTP server
-	// decodes the path before the router sees it, so on the decoded path a name
-	// containing "/copyTo/b/" is indistinguishable from a copy sub-operation.
-	// Deciding structure on the escaped path is what keeps the two apart: this
-	// request was previously served as a cross-bucket copy that answered 200
-	// without composing anything, so the assertions below cover the composite AND
-	// every object a misparsed copy would have read or written.
-	//
-	// "nested" is the source such a copy misparses out of the destination name,
-	// so its bytes surviving unchanged is what proves no copy was performed.
+	// Escaping keeps /copyTo/b/ inside the destination name as data instead of
+	// routing it as a copy operation. The decoy source and bucket checks below
+	// verify that no copy-side effects occurred.
 	simpleUpload(t, base, "compose-slash", "nested", "decoy source content")
 
 	const encodedName = "nested/copyTo/b/compose-slash-decoy/o/merged"
@@ -597,7 +557,6 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 		t.Fatalf("expected size 12, got %s", encoded.Size)
 	}
 
-	// The composite is readable under exactly the name that was requested.
 	encodedMediaResp, err := http.Get(base + "/storage/v1/b/compose-slash/o/" + url.PathEscape(encodedName) + "?alt=media")
 	if err != nil {
 		t.Fatal(err)
@@ -609,7 +568,6 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 		t.Fatalf("expected 'Hello, world', got %q", string(encodedBody))
 	}
 
-	// The object a misparsed copy would have read is untouched.
 	decoySrcResp, err := http.Get(base + "/storage/v1/b/compose-slash/o/nested?alt=media")
 	if err != nil {
 		t.Fatal(err)
@@ -621,7 +579,6 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 		t.Fatalf("expected the decoy source to keep its bytes, got %q", string(decoySrcBody))
 	}
 
-	// And the bucket named inside the destination was never written to.
 	decoyListResp, err := http.Get(base + "/storage/v1/b/compose-slash-decoy/o")
 	if err != nil {
 		t.Fatal(err)
@@ -647,8 +604,8 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 		t.Fatalf("expected name 'dir/compose', got %q", tail.Name)
 	}
 
-	// The same escaped name without the structural token is not a compose
-	// request, so it keeps its pre-existing 405 and composes nothing.
+	// Without the terminal structural /compose token, the same escaped name
+	// falls through to generic object operations and returns 405.
 	notComposeResp := postJSON(t, base+"/storage/v1/b/compose-slash/o/"+url.PathEscape("dir/compose"),
 		`{"sourceObjects":[{"name":"parts/part-1"}]}`)
 	assertStatus(t, notComposeResp, 405)
@@ -680,9 +637,6 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 	}
 }
 
-// TestComposeObjectOverwritesDestination checks that an existing destination is
-// replaced unconditionally — no conflict response, and its content and size both
-// reflect the composition.
 func TestComposeObjectOverwritesDestination(t *testing.T) {
 	base := testServer(t)
 
@@ -764,9 +718,8 @@ func TestComposeObjectMethodNotAllowed(t *testing.T) {
 		t.Fatalf("expected domain 'global', got %q", errResp.Error.Errors[0].Domain)
 	}
 
-	// The /compose suffix is anchored to the object-name segment, so a POST that
-	// names no destination object is not a compose request and keeps its
-	// pre-existing 405 instead of composing into an object called "compose".
+	// A destination-less POST does not contain the terminal structural token and
+	// therefore falls through to 405 handling instead of creating compose.
 	noObjectResp := postJSON(t, base+"/storage/v1/b/compose-method/o/compose",
 		`{"sourceObjects":[{"name":"part-1"}]}`)
 	assertStatus(t, noObjectResp, 405)
@@ -777,7 +730,6 @@ func TestComposeObjectMethodNotAllowed(t *testing.T) {
 	assertStatus(t, noPathResp, 405)
 	noPathResp.Body.Close()
 
-	// Neither shape may have created an object.
 	strayResp, err := http.Get(base + "/storage/v1/b/compose-method/o/compose")
 	if err != nil {
 		t.Fatal(err)

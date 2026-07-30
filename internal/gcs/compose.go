@@ -13,17 +13,9 @@ import (
 // valid and 33 is rejected with 400.
 const maxComposeSourceObjects = 32
 
-// maxComposeRequestBytes caps how much of a compose body is read. The source
-// limit above cannot bound the work a request costs, because it can only be
-// applied once the whole sourceObjects array has already been materialized;
-// capping the bytes is what keeps an oversized array, source name or
-// accepted-but-ignored field from driving unbounded decoder allocation on this
-// unauthenticated endpoint.
-//
-// The cap sits far above any legitimate request: Cloud Storage object names are
-// at most 1024 bytes, so 32 maximum-length sources occupy roughly 34 KiB of
-// JSON and the ignored fields add a few KiB more. 1 MiB therefore leaves ample
-// headroom while still bounding the decoder.
+// maxComposeRequestBytes bounds decoder allocation before source-count validation
+// on this unauthenticated endpoint. One MiB leaves ample room for 32
+// maximum-length source names and normal optional fields.
 const maxComposeRequestBytes = 1 << 20
 
 // composeRequest models the supported compose body. Only sourceObjects is
@@ -69,11 +61,8 @@ func (s *Service) handleComposeObject(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	// Bound the body before decoding it, so an unauthenticated request cannot
-	// make the decoder read and materialize an arbitrarily large document. An
-	// over-cap body surfaces as *http.MaxBytesError, which is reported through
-	// the same shared 400 envelope as any other unusable body; errors.As is used
-	// rather than a type assertion because the decoder is free to wrap it.
+	// Apply the byte cap before decoding; errors.As also catches wrapped
+	// *http.MaxBytesError values for the shared 400 response.
 	r.Body = http.MaxBytesReader(w, r.Body, maxComposeRequestBytes)
 
 	// One decoder for both reads below, so the second resumes exactly where the
@@ -95,15 +84,8 @@ func (s *Service) handleComposeObject(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	// A compose body is exactly ONE JSON document, so nothing but optional
-	// whitespace may follow it and io.EOF is the only acceptable outcome of the
-	// next read. Without this the request would only ever be validated as far as
-	// its first value: a second document would be silently ignored while the
-	// first composed, trailing garbage would pass as well-formed, and the byte cap
-	// would only cover the prefix the decoder happened to consume. A nil error
-	// means a second value decoded, which is malformed too. Trailing whitespace is
-	// not a value, so clients that encode with json.Encoder — which appends a
-	// newline — keep working.
+	// Require EOF after the first document so second values or trailing garbage are
+	// rejected while json.Encoder's trailing whitespace remains valid.
 	var trailing json.RawMessage
 	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
 		if errors.As(err, &tooLarge) {

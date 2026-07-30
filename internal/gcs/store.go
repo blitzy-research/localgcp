@@ -257,26 +257,16 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	return &obj, nil
 }
 
-// ComposeObject concatenates the content of srcNames, in the order given, into
-// a new object dstName inside bucket. Every source must live in that same
-// bucket: the operation only ever indexes the destination bucket's object map,
-// so a cross-bucket source is inexpressible. An existing destination is
-// overwritten unconditionally, exactly as PutObject and CopyObject do.
+// ComposeObject concatenates srcNames in order into dstName within bucket,
+// overwriting any existing destination. All sources are resolved from the same
+// bucket atomically, so a missing source leaves the destination unchanged.
 //
-// The entire read-all-then-write sequence runs under a single write lock, which
-// makes it atomic and fail-atomic: a concurrent delete cannot produce a
-// partially composed object, and a missing source aborts with nothing written.
-// It deliberately does not delegate to GetObject or PutObject — sync.RWMutex is
-// not reentrant, so either call would deadlock, and GetObject cannot
-// distinguish a missing bucket from a missing object, which is precisely the
-// distinction the two error cases must report.
-//
-// Note on md5Hash: real Cloud Storage omits md5Hash on composite objects and
-// relies on crc32c for their integrity. This emulator instead computes md5Hash
-// over the concatenated bytes so that a composed object carries the same
-// metadata set as every other emulated object; crc32c keeps the emulator-wide
-// placeholder value.
+// Real Cloud Storage omits md5Hash on composite objects. This emulator computes
+// it over the concatenated bytes for consistency with other emulated objects;
+// crc32c retains the emulator-wide placeholder.
 func (s *Store) ComposeObject(bucket, dstName string, srcNames []string, contentType string) (*Object, error) {
+	// Keep source reads and the destination write under one lock. Do not call
+	// GetObject or PutObject here: sync.RWMutex is not reentrant.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
