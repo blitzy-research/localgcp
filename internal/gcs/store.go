@@ -156,6 +156,16 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 		return nil, fmt.Errorf("not found: bucket %q", bucket)
 	}
 
+	obj := newObjectMeta(bucket, name, contentType, content)
+
+	s.objects[bucket][name] = &storedObject{Meta: *obj, Content: content}
+	s.persist()
+	return obj, nil
+}
+
+// newObjectMeta builds metadata without accessing Store state, so callers may
+// invoke it while holding the store lock.
+func newObjectMeta(bucket, name, contentType string, content []byte) *Object {
 	if contentType == "" {
 		contentType = "application/octet-stream"
 	}
@@ -178,9 +188,7 @@ func (s *Store) PutObject(bucket, name, contentType string, content []byte) (*Ob
 		Etag:        hex.EncodeToString(sha256sum[:8]),
 	}
 
-	s.objects[bucket][name] = &storedObject{Meta: *obj, Content: content}
-	s.persist()
-	return obj, nil
+	return obj
 }
 
 func (s *Store) GetObject(bucket, name string) (*Object, []byte, bool) {
@@ -249,6 +257,53 @@ func (s *Store) CopyObject(srcBucket, srcName, dstBucket, dstName string) (*Obje
 	return &obj, nil
 }
 
+// ComposeObject concatenates srcNames in order into dstName within bucket,
+// overwriting any existing destination. All sources are resolved from the same
+// bucket atomically, so a missing source leaves the destination unchanged.
+//
+// Real Cloud Storage omits md5Hash on composite objects. This emulator computes
+// it over the concatenated bytes for consistency with other emulated objects;
+// crc32c retains the emulator-wide placeholder.
+func (s *Store) ComposeObject(bucket, dstName string, srcNames []string, contentType string) (*Object, error) {
+	// Keep source reads and the destination write under one lock. Do not call
+	// GetObject or PutObject here: sync.RWMutex is not reentrant.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, exists := s.buckets[bucket]; !exists {
+		return nil, fmt.Errorf("not found: bucket %q", bucket)
+	}
+	objs := s.objects[bucket]
+
+	// Resolve every source before writing anything, so a missing source leaves
+	// the destination untouched. The same pass sizes the destination buffer and
+	// captures the first source's content type as the fallback.
+	sources := make([]*storedObject, 0, len(srcNames))
+	total := 0
+	for i, srcName := range srcNames {
+		src, ok := objs[srcName]
+		if !ok {
+			return nil, fmt.Errorf("not found: object %q in bucket %q", srcName, bucket)
+		}
+		if i == 0 && contentType == "" {
+			contentType = src.Meta.ContentType
+		}
+		sources = append(sources, src)
+		total += len(src.Content)
+	}
+
+	content := make([]byte, 0, total)
+	for _, src := range sources {
+		content = append(content, src.Content...)
+	}
+
+	obj := newObjectMeta(bucket, dstName, contentType, content)
+
+	s.objects[bucket][dstName] = &storedObject{Meta: *obj, Content: content}
+	s.persist()
+	return obj, nil
+}
+
 // ListObjects lists objects in a bucket with optional prefix and delimiter filtering.
 func (s *Store) ListObjects(bucket, prefix, delimiter string, maxResults int) ([]Object, []string) {
 	s.mu.RLock()
@@ -300,8 +355,8 @@ func (s *Store) ListObjects(bucket, prefix, delimiter string, maxResults int) ([
 // --- Persistence ---
 
 type persistedState struct {
-	Buckets []Bucket                   `json:"buckets"`
-	Objects map[string][]persistedObj  `json:"objects"`
+	Buckets []Bucket                  `json:"buckets"`
+	Objects map[string][]persistedObj `json:"objects"`
 }
 
 type persistedObj struct {

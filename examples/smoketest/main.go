@@ -1,8 +1,9 @@
 // Smoke test for localgcp — exercises all 4 services using official GCP client libraries.
 //
 // Usage:
-//   Terminal 1:  ./localgcp up
-//   Terminal 2:  go run ./examples/smoketest/
+//
+//	Terminal 1:  ./localgcp up
+//	Terminal 2:  go run ./examples/smoketest/
 package main
 
 import (
@@ -15,9 +16,9 @@ import (
 
 	"cloud.google.com/go/firestore"
 	"cloud.google.com/go/pubsub"
-	"cloud.google.com/go/storage"
 	secretmanager "cloud.google.com/go/secretmanager/apiv1"
 	"cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
+	"cloud.google.com/go/storage"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	"google.golang.org/grpc"
@@ -25,11 +26,11 @@ import (
 )
 
 const (
-	project  = "localgcp-test"
-	gcsPort  = "localhost:4443"
-	psPort   = "localhost:8085"
-	smPort   = "localhost:8086"
-	fsPort   = "localhost:8088"
+	project = "localgcp-test"
+	gcsPort = "localhost:4443"
+	psPort  = "localhost:8085"
+	smPort  = "localhost:8086"
+	fsPort  = "localhost:8088"
 )
 
 var (
@@ -140,6 +141,65 @@ func testGCS(ctx context.Context) {
 	} else {
 		check("List objects (count=1)", fmt.Errorf("got %d objects", count))
 	}
+
+	// Compose the parts after the count assertion so it still sees only hello.txt.
+	w1 := bucket.Object("part-1.txt").NewWriter(ctx)
+	w1.ContentType = "text/plain"
+	_, err = w1.Write([]byte("Hello, "))
+	if err == nil {
+		err = w1.Close()
+	}
+	check("Upload compose part 1", err)
+
+	w2 := bucket.Object("part-2.txt").NewWriter(ctx)
+	w2.ContentType = "text/plain"
+	_, err = w2.Write([]byte("world"))
+	if err == nil {
+		err = w2.Close()
+	}
+	check("Upload compose part 2", err)
+
+	composed := "Hello, world"
+	dst := bucket.Object("merged.txt")
+	attrs, err := dst.ComposerFrom(bucket.Object("part-1.txt"), bucket.Object("part-2.txt")).Run(ctx)
+	if check("Compose objects", err) {
+		if attrs.Size == int64(len(composed)) {
+			check("Compose objects (size)", nil)
+		} else {
+			check("Compose objects (size)", fmt.Errorf("got %d, want %d", attrs.Size, len(composed)))
+		}
+		// No destination content type was requested, so the composite inherits
+		// the first source's.
+		if attrs.ContentType == "text/plain" {
+			check("Compose objects (content type)", nil)
+		} else {
+			check("Compose objects (content type)",
+				fmt.Errorf("got %q, want %q", attrs.ContentType, "text/plain"))
+		}
+	}
+
+	// Read the composite back; the Go client reads through the XML API path.
+	cr, err := dst.NewReader(ctx)
+	if check("Compose read back (open)", err) {
+		merged, err := io.ReadAll(cr)
+		cr.Close()
+		if check("Compose read back (read)", err) {
+			if string(merged) == composed {
+				check("Compose read back (content match)", nil)
+			} else {
+				check("Compose read back (content match)",
+					fmt.Errorf("got %q, want %q", string(merged), composed))
+			}
+		}
+	}
+
+	// Clean up the compose objects so the bucket is empty before it is deleted.
+	err = bucket.Object("part-1.txt").Delete(ctx)
+	check("Delete compose part 1", err)
+	err = bucket.Object("part-2.txt").Delete(ctx)
+	check("Delete compose part 2", err)
+	err = dst.Delete(ctx)
+	check("Delete composed object", err)
 
 	// Delete object.
 	err = bucket.Object("hello.txt").Delete(ctx)
@@ -315,9 +375,9 @@ func testFirestore(ctx context.Context) {
 
 	// Create document.
 	doc, _, err := col.Add(ctx, map[string]interface{}{
-		"name":  "Alice",
-		"age":   30,
-		"city":  "Seattle",
+		"name": "Alice",
+		"age":  30,
+		"city": "Seattle",
 	})
 	check("Create document", err)
 
@@ -335,9 +395,16 @@ func testFirestore(ctx context.Context) {
 		}
 	}
 
-	// Create more docs for querying.
-	col.Add(ctx, map[string]interface{}{"name": "Bob", "age": 25, "city": "Portland"})
-	col.Add(ctx, map[string]interface{}{"name": "Charlie", "age": 35, "city": "Seattle"})
+	// Create more docs for querying. Both refs are kept so the cleanup below can
+	// delete them: the queries assert how many documents the collection holds, so
+	// anything this run leaves behind is counted again the next time the harness
+	// runs against the same emulator. Both creations are reported, because a
+	// silent failure here would surface later as a confusing query-count mismatch
+	// instead of its real cause.
+	bobDoc, _, err := col.Add(ctx, map[string]interface{}{"name": "Bob", "age": 25, "city": "Portland"})
+	check("Create query document (Bob)", err)
+	charlieDoc, _, err := col.Add(ctx, map[string]interface{}{"name": "Charlie", "age": 35, "city": "Seattle"})
+	check("Create query document (Charlie)", err)
 
 	// Query: city == "Seattle"
 	iter := col.Where("city", "==", "Seattle").Documents(ctx)
@@ -387,10 +454,22 @@ func testFirestore(ctx context.Context) {
 			fmt.Errorf("got ages=%v", ages))
 	}
 
-	// Delete docs.
+	// Delete docs. Every document created above is removed, so the collection is
+	// left exactly as it was found and the harness stays repeatable against a
+	// long-lived emulator. Each deletion is reported: a discarded cleanup error
+	// would leave state behind while the run still claimed zero failures, which is
+	// the repeatability these deletions exist to protect.
 	if doc != nil {
 		_, err = doc.Delete(ctx)
 		check("Delete document", err)
+	}
+	if bobDoc != nil {
+		_, err = bobDoc.Delete(ctx)
+		check("Delete query document (Bob)", err)
+	}
+	if charlieDoc != nil {
+		_, err = charlieDoc.Delete(ctx)
+		check("Delete query document (Charlie)", err)
 	}
 
 	fmt.Println()
