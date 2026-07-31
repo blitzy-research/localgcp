@@ -635,6 +635,71 @@ func TestComposeObjectWithSlashesInName(t *testing.T) {
 	if copied.Size != "7" {
 		t.Fatalf("expected the copied size 7, got %s", copied.Size)
 	}
+
+	// A copy source whose own name embeds an encoded /copyTo/b/ keeps that name as
+	// data. Because the separator is located on the escaped path, the copy lands in
+	// the requested bucket under the requested name; locating it on the decoded
+	// remainder would split at the name instead and copy the wrong object into the
+	// bucket the name mentions.
+	dstBucketResp := postJSON(t, base+"/storage/v1/b?project=test", `{"name":"compose-slash-copy-dst"}`)
+	assertStatus(t, dstBucketResp, 200)
+	dstBucketResp.Body.Close()
+
+	const markerSource = "marker/copyTo/b/compose-slash-decoy/o/fake"
+	simpleUpload(t, base, "compose-slash", markerSource, "INTENDED")
+	// The object a decoded split would select as the source instead.
+	simpleUpload(t, base, "compose-slash", "marker", "DECOY")
+
+	markerCopyResp := postJSON(t,
+		base+"/storage/v1/b/compose-slash/o/"+url.PathEscape(markerSource)+
+			"/copyTo/b/compose-slash-copy-dst/o/result",
+		"{}")
+	assertStatus(t, markerCopyResp, 200)
+
+	var markerCopy Object
+	decodeBody(t, markerCopyResp, &markerCopy)
+	if markerCopy.Bucket != "compose-slash-copy-dst" || markerCopy.Name != "result" {
+		t.Fatalf("expected copy to compose-slash-copy-dst/result, got %s/%s", markerCopy.Bucket, markerCopy.Name)
+	}
+	if markerCopy.Size != "8" {
+		t.Fatalf("expected the size 8 of %q, got %s", markerSource, markerCopy.Size)
+	}
+
+	markerReadResp, err := http.Get(base + "/storage/v1/b/compose-slash-copy-dst/o/result?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, markerReadResp, 200)
+	markerBody, _ := io.ReadAll(markerReadResp.Body)
+	markerReadResp.Body.Close()
+	if string(markerBody) != "INTENDED" {
+		t.Fatalf("expected the copy to carry 'INTENDED', got %q", string(markerBody))
+	}
+
+	// The bucket named inside the source name gained nothing: it still holds only
+	// the object the genuine copy above created.
+	markerListResp, err := http.Get(base + "/storage/v1/b/compose-slash-decoy/o")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, markerListResp, 200)
+
+	var markerList ObjectList
+	decodeBody(t, markerListResp, &markerList)
+	if len(markerList.Items) != 1 || markerList.Items[0].Name != "copied/compose" {
+		t.Fatalf("expected compose-slash-decoy to hold only copied/compose, got %+v", markerList.Items)
+	}
+
+	markerSrcResp, err := http.Get(base + "/storage/v1/b/compose-slash/o/marker?alt=media")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertStatus(t, markerSrcResp, 200)
+	markerSrcBody, _ := io.ReadAll(markerSrcResp.Body)
+	markerSrcResp.Body.Close()
+	if string(markerSrcBody) != "DECOY" {
+		t.Fatalf("expected the decoy source to keep its bytes, got %q", string(markerSrcBody))
+	}
 }
 
 func TestComposeObjectOverwritesDestination(t *testing.T) {

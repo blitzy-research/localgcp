@@ -355,8 +355,8 @@ func (s *Store) ListObjects(bucket, prefix, delimiter string, maxResults int) ([
 // --- Persistence ---
 
 type persistedState struct {
-	Buckets []Bucket                   `json:"buckets"`
-	Objects map[string][]persistedObj  `json:"objects"`
+	Buckets []Bucket                  `json:"buckets"`
+	Objects map[string][]persistedObj `json:"objects"`
 }
 
 type persistedObj struct {

@@ -11,6 +11,7 @@ import (
 	"mime/multipart"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -26,7 +27,7 @@ type Service struct {
 
 	// resumable uploads in progress: upload ID -> pending upload state
 	resumableMu sync.Mutex
-	resumables   map[string]*resumableUpload
+	resumables  map[string]*resumableUpload
 }
 
 type resumableUpload struct {
@@ -80,11 +81,12 @@ func (s *Service) Start(ctx context.Context, addr string) error {
 // registerRoutes sets up all GCS JSON API routes.
 //
 // GCS JSON API path structure:
-//   /storage/v1/b                          — list/create buckets
-//   /storage/v1/b/{bucket}                 — get/delete bucket
-//   /storage/v1/b/{bucket}/o               — list objects
-//   /storage/v1/b/{bucket}/o/{object...}   — get/delete object (object can contain /)
-//   /upload/storage/v1/b/{bucket}/o        — upload objects
+//
+//	/storage/v1/b                          — list/create buckets
+//	/storage/v1/b/{bucket}                 — get/delete bucket
+//	/storage/v1/b/{bucket}/o               — list objects
+//	/storage/v1/b/{bucket}/o/{object...}   — get/delete object (object can contain /)
+//	/upload/storage/v1/b/{bucket}/o        — upload objects
 //
 // Object names can contain slashes, so we can't use simple path params.
 // We route by prefix and parse manually.
@@ -128,6 +130,29 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Write(content)
 }
 
+// escapedPathRemainder returns the request path in its percent-encoded form with
+// the JSON API bucket prefix removed, which is the form the sub-operation
+// separators must be located in. r.URL.Path has already decoded every %2F into
+// "/", and clients percent-encode the slashes inside an object name, so on the
+// decoded remainder a name like "nested/copyTo/b/other/o/thing" is
+// indistinguishable from a genuine copy separator. In the escaped form a literal
+// "/" is always a separator while %2F is still object-name data.
+//
+// RawPath holds the request path verbatim whenever it differs from the canonical
+// encoding of Path — exactly when an object name carries escapes. It is
+// preferred over EscapedPath(), which re-encodes the already-decoded Path and
+// would turn those encoded slashes back into separators; when RawPath is empty
+// the request carried no such escapes, so EscapedPath() is exact. ServeMux
+// matches the escaped path, so a request that escapes part of the prefix itself
+// never reaches this dispatcher and TrimPrefix always finds the literal prefix.
+func escapedPathRemainder(r *http.Request) string {
+	escaped := r.URL.RawPath
+	if escaped == "" {
+		escaped = r.URL.EscapedPath()
+	}
+	return strings.TrimPrefix(escaped, "/storage/v1/b/")
+}
+
 func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 
@@ -148,19 +173,16 @@ func (s *Service) route(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(path, "/storage/v1/b/")
 
 	// Match sub-operation tokens on the escaped path so %2F inside object names
-	// remains data rather than becoming /copyTo/ or /compose structure. Use RawPath
-	// when available because EscapedPath may canonicalize a non-canonical raw path;
-	// handlers still receive the decoded remainder.
-	escapedRest := r.URL.RawPath
-	if escapedRest == "" {
-		escapedRest = r.URL.EscapedPath()
-	}
-	escapedRest = strings.TrimPrefix(escapedRest, "/storage/v1/b/")
+	// remains data rather than becoming /copyTo/ or /compose structure.
+	escapedRest := escapedPathRemainder(r)
 
 	// Check for copy: {bucket}/o/{src}/copyTo/b/{dstBucket}/o/{dstObj}
+	// The handler gets the escaped remainder too, so it locates the same
+	// /copyTo/b/ separator this condition matched instead of an encoded one that
+	// only looks like it after decoding.
 	if strings.Contains(escapedRest, "/copyTo/b/") {
 		if r.Method == http.MethodPost {
-			s.handleCopyObject(w, r, rest)
+			s.handleCopyObject(w, r, escapedRest)
 		} else {
 			writeError(w, http.StatusMethodNotAllowed, "methodNotAllowed", "Method not allowed")
 		}
@@ -335,24 +357,43 @@ func (s *Service) handleListObjects(w http.ResponseWriter, r *http.Request, buck
 	})
 }
 
-func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, rest string) {
+// handleCopyObject copies one object, taking the escaped path remainder the
+// dispatcher matched on. The /copyTo/b/ separator is located in that escaped form
+// and each side is decoded afterwards, so an object name carrying an encoded
+// %2FcopyTo%2Fb%2F stays data: locating the separator on the decoded remainder
+// would instead pick the caller's name as the split point and copy an unrelated
+// object into an unrequested bucket.
+func (s *Service) handleCopyObject(w http.ResponseWriter, r *http.Request, escapedRest string) {
 	// Format: {srcBucket}/o/{srcObject}/copyTo/b/{dstBucket}/o/{dstObject}
-	parts := strings.SplitN(rest, "/o/", 2)
+	copyIdx := strings.Index(escapedRest, "/copyTo/b/")
+	if copyIdx < 0 {
+		writeBadRequest(w, "Invalid copy path")
+		return
+	}
+
+	// Decode each side only after the separator has been located. An invalid
+	// escape cannot reach a handler — net/http rejects the request first — so
+	// this is defensive depth for a malformed remainder.
+	source, err := url.PathUnescape(escapedRest[:copyIdx])
+	if err != nil {
+		writeBadRequest(w, "Invalid copy path")
+		return
+	}
+	destination, err := url.PathUnescape(escapedRest[copyIdx+len("/copyTo/b/"):])
+	if err != nil {
+		writeBadRequest(w, "Invalid copy destination path")
+		return
+	}
+
+	parts := strings.SplitN(source, "/o/", 2)
 	if len(parts) != 2 {
 		writeBadRequest(w, "Invalid copy path")
 		return
 	}
 	srcBucket := parts[0]
+	srcObject := parts[1]
 
-	copyIdx := strings.Index(parts[1], "/copyTo/b/")
-	if copyIdx < 0 {
-		writeBadRequest(w, "Invalid copy path")
-		return
-	}
-	srcObject := parts[1][:copyIdx]
-
-	dstPart := parts[1][copyIdx+len("/copyTo/b/"):]
-	dstParts := strings.SplitN(dstPart, "/o/", 2)
+	dstParts := strings.SplitN(destination, "/o/", 2)
 	if len(dstParts) != 2 {
 		writeBadRequest(w, "Invalid copy destination path")
 		return
@@ -660,9 +701,53 @@ func (s *Service) loggingMiddleware(next http.Handler) http.Handler {
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next.ServeHTTP(rw, r)
 		s.logger.Printf("%s %s %d %s",
-			r.Method, r.URL.Path, rw.statusCode,
+			sanitizeLogField(r.Method), sanitizeLogField(r.URL.Path), rw.statusCode,
 			time.Since(start).Round(time.Millisecond))
 	})
+}
+
+// sanitizeLogField escapes the control bytes of a caller-supplied field so one
+// request can never produce more than one physical log record. Object names
+// travel through the request path and may hold any byte once percent-decoded, so
+// an encoded CR or LF would otherwise end the record early and let the remainder
+// pose as a record of its own, while an ESC could drive the reader's terminal.
+// Values without control bytes are returned unchanged, so ordinary records keep
+// their exact format, and multi-byte UTF-8 names pass through untouched.
+func sanitizeLogField(value string) string {
+	clean := true
+	for i := 0; i < len(value); i++ {
+		if isLogControlByte(value[i]) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return value
+	}
+
+	var b strings.Builder
+	b.Grow(len(value) + 8)
+	for i := 0; i < len(value); i++ {
+		switch c := value[i]; {
+		case c == '\n':
+			b.WriteString(`\n`)
+		case c == '\r':
+			b.WriteString(`\r`)
+		case c == '\t':
+			b.WriteString(`\t`)
+		case isLogControlByte(c):
+			fmt.Fprintf(&b, `\x%02x`, c)
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+// isLogControlByte reports whether c is a C0 control byte or DEL, the bytes that
+// must not reach a log record verbatim.
+func isLogControlByte(c byte) bool {
+	return c < 0x20 || c == 0x7f
 }
 
 type responseWriter struct {

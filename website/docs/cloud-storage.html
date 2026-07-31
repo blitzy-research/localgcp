@@ -236,7 +236,7 @@
       <ul>
         <li><strong>Bucket CRUD</strong> -- create, get, list, delete buckets</li>
         <li><strong>Object upload</strong> -- simple, multipart, and resumable uploads</li>
-        <li><strong>Object download</strong> -- full content or range reads</li>
+        <li><strong>Object download</strong> -- full content (a range request returns the whole object)</li>
         <li><strong>Object operations</strong> -- metadata, delete, copy, compose</li>
         <li><strong>Object listing</strong> -- with prefix and delimiter (directory-like browsing)</li>
         <li><strong>Signed URLs</strong> -- generate and use signed download URLs</li>
@@ -248,7 +248,7 @@
       <p>localgcp provides a signed URL endpoint for generating pre-signed download URLs:</p>
 <pre class="code-block"><span class="prompt">$</span> curl -X POST http://localhost:4443/_localgcp/sign \
     -H <span class="string">"Content-Type: application/json"</span> \
-    -d <span class="string">'{"bucket":"my-bucket","object":"hello.txt","ttl_seconds":3600}'</span></pre>
+    -d <span class="string">'{"bucket":"my-bucket","object":"hello.txt","expires":3600}'</span></pre>
 
       <p>The response contains a signed URL you can use to download the object without authentication. This is useful for testing pre-signed URL flows in your application.</p>
 
